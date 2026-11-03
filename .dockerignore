@@ -1,0 +1,6 @@
+.git
+bin
+dist
+docs
+bench
+*.md
