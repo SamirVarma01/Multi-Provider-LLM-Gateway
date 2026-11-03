@@ -1,0 +1,15 @@
+# Binaries
+/bin/
+/dist/
+*.test
+*.out
+
+# Local env
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
