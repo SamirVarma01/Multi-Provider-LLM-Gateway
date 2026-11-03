@@ -616,8 +616,11 @@ added in Phase 2 for adapter tests).
   gateway's estimator (word-based), so tests can tell reported usage from estimated.
 - **Records usage:** keyed by the gateway's `X-Request-ID` and `X-Attempt` headers. Each
   record holds `{provider, model, prompt_tokens, completion_tokens, billable, outcome}`.
-  An attempt is **billable iff the mock flushed at least one content chunk**, and its
-  completion tokens are the tokens flushed. Queried with
+  An attempt is **billable iff it completed or flushed at least one content token**. A
+  completed response reports usage, so the gateway charges its input even with zero
+  output. Its completion tokens are the tokens flushed. A completed attempt is
+  recorded *before* its final bytes (`[DONE]` / the JSON body) are written, so a caller
+  that has read the whole response can always find the record. Queried with
   `GET /_mock/usage?request_id=` and exported with `GET /_mock/usage`.
 - Records are kept in memory and optionally appended to JSONL, so they survive a mock
   restart. Chaos tests kill only the gateway.
