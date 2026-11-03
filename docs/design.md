@@ -273,7 +273,7 @@ the provider. It is listed as a non-guarantee.
 providers:
   - name: mock-a
     format: openai            # adapter
-    base_url: http://mock:9000/p/mock-a
+    base_url: http://mock:9000/p/mock-a/v1   # up to and including /v1
     api_key_env: MOCK_A_KEY   # optional
 models:
   - alias: fast-chat
