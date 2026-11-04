@@ -200,7 +200,7 @@ func TestChatHappyPath(t *testing.T) {
 		t.Errorf("usage = %+v, mock recorded %+v", out.Usage, rec)
 	}
 	msg := out.Choices[0]
-	if msg.Message.Role != "assistant" || len(strings.Fields(msg.Message.Content)) != 12 || msg.FinishReason != "stop" {
+	if msg.Message.Role != "assistant" || len(strings.Fields(*msg.Message.Content)) != 12 || msg.FinishReason != "stop" {
 		t.Errorf("choice = %+v", msg)
 	}
 }

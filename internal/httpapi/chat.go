@@ -89,7 +89,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Created: start.Unix(),
 		Model:   body.Model,
 		Choices: []oai.Choice{{
-			Message:      oai.ResponseMessage{Role: string(provider.RoleAssistant), Content: resp.Content},
+			Message:      oai.ResponseMessage{Role: string(provider.RoleAssistant), Content: &resp.Content},
 			FinishReason: resp.FinishReason,
 		}},
 	}

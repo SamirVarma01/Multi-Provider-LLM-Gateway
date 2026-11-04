@@ -346,13 +346,14 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, c *call, b Beh
 		return
 	}
 
+	text := strings.Join(tokens, "")
 	resp := oai.ChatCompletionResponse{
 		ID:      "chatcmpl-mock-" + c.rec.RequestID,
 		Object:  "chat.completion",
 		Created: start.Unix(),
 		Model:   req.Model,
 		Choices: []oai.Choice{{
-			Message:      oai.ResponseMessage{Role: "assistant", Content: strings.Join(tokens, "")},
+			Message:      oai.ResponseMessage{Role: "assistant", Content: &text},
 			FinishReason: finishReason,
 		}},
 	}
