@@ -101,7 +101,7 @@ All error bodies use the OpenAI shape: `{"error":{"message","type","code","reque
 
 | Method & path | Notes |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions request. `stream: true` → SSE. Accepts `max_tokens` or `max_completion_tokens`. Optional `X-Route-Policy: cheapest\|fastest\|priority` overrides the alias default. Response headers: `X-Request-ID`, `X-Gateway-Provider`, `X-Gateway-Attempts`. |
+| `POST /v1/chat/completions` | OpenAI Chat Completions request, streaming (`stream: true` → SSE) or not. Accepts `max_tokens` or `max_completion_tokens`, tools, `tool_choice`, `parallel_tool_calls`, tool messages, and image parts. Usage carries a gateway extension, `estimated: true`, when a count was estimated (§5.5). Optional `X-Route-Policy: cheapest\|fastest\|priority` overrides the alias default (Phase 3). Response headers: `X-Request-ID`, `X-Gateway-Provider`, `X-Gateway-Attempts`. |
 | `GET /v1/models` | Lists aliases in OpenAI list format, with an extra `pricing` object (max input/output price per 1M tokens across candidates). |
 | `GET /healthz` | Liveness: the process is up. |
 | `GET /readyz` | Readiness: Postgres and Redis are reachable. |
@@ -142,7 +142,8 @@ type Target struct {
 
 type Provider interface {
     Name() string
-    // Supports reports whether this provider can honor the request (tools, images, params).
+    // Supports reports whether this provider can honor the request. A non-nil error
+    // says what it cannot do; requests are never silently altered to fit.
     Supports(req *ChatRequest) error
     // Stream starts an upstream streaming call. It returns after the upstream response
     // status is known; the error is classified (see UpstreamError).
@@ -150,22 +151,33 @@ type Provider interface {
 }
 
 type Stream interface {
-    Recv() (*Chunk, error) // io.EOF on clean end; *UpstreamError on failure
-    Usage() Usage          // valid after Recv returns a non-nil error
+    Recv() (*Chunk, error) // io.EOF on clean end; *UpstreamError on failure; ctx.Err() if the caller cancelled
+    Usage() Reported       // what the provider has reported so far
     Close() error          // idempotent; releases the upstream connection
 }
 
+// Providers can report the two counts at different times (Anthropic sends input
+// tokens first and output tokens at the end), so each has its own flag.
+type Reported struct {
+    PromptTokens, CompletionTokens int
+    HasPrompt, HasCompletion       bool
+}
+
 type UpstreamError struct {
-    Status    int  // upstream HTTP status, 0 for transport errors
-    Kind      ErrKind // Transport, Timeout, RateLimited, Server, Auth, BadRequest, Unsupported
-    Retryable bool
+    Provider  string
+    Status    int     // upstream HTTP status, 0 for transport errors
+    Kind      ErrKind // Transport, Timeout, RateLimited, Server, Config, BadRequest, Protocol
+    Retryable bool    // failover to another target may help
     Msg       string
 }
 ```
 
-`Stream` creates no goroutines. Reads are bounded by the request context and by an
-idle timer (`time.AfterFunc` that cancels the attempt context, reset on each chunk).
-Tests check this with `goleak`.
+A caller cancellation is returned as `ctx.Err()`, never as an `UpstreamError`, so a
+client leaving is not counted against the provider's health.
+
+`Stream` creates no goroutines; reads are bounded by the request context. (The
+per-attempt TTFT and idle timeouts in §6.4 arrive in Phase 3.) Tests check for leaks
+with `goleak`.
 
 ### 5.2 Internal format (OpenAI-shaped)
 
@@ -174,22 +186,23 @@ translated in both directions:
 
 ```go
 type ChatRequest struct {
-    Model        string
-    Messages     []Message
-    Tools        []Tool
-    ToolChoice   *ToolChoice
-    MaxTokens    *int
-    Temperature  *float64
-    TopP         *float64
-    Stop         []string
-    Stream       bool // client mode; upstream always streams
-    IncludeUsage bool // client set stream_options.include_usage
-    User         string
-    Extra        map[string]json.RawMessage // unknown fields; forwarded to OpenAI-format targets only
+    Model             string
+    Messages          []Message
+    Tools             []Tool // {Name, Description, Parameters (JSON Schema), Strict}
+    ToolChoice        *ToolChoice
+    ParallelToolCalls *bool
+    MaxTokens         *int // effective output cap; always sent upstream
+    Temperature       *float64
+    TopP              *float64
+    Stop              []string
+    Stream            bool // client mode; upstream always streams
+    IncludeUsage      bool // client set stream_options.include_usage
+    User              string
+    Extra             map[string]json.RawMessage // unmodeled fields; forwarded to OpenAI-format targets only
 }
 type Message struct {
-    Role       Role          // system | user | assistant | tool
-    Content    []ContentPart // text | image_url
+    Role       Role          // system (also accepts "developer") | user | assistant | tool
+    Content    []ContentPart // text | image (https URL or base64 data URI)
     ToolCalls  []ToolCall    // assistant only
     ToolCallID string        // tool only
 }
@@ -199,57 +212,85 @@ type Chunk struct {
     Content      string
     ToolCalls    []ToolCallDelta // {Index, ID, Name, ArgumentsFragment}
     FinishReason string          // stop | length | tool_calls | content_filter
-    Usage        *Usage
 }
-type Usage struct {
+type Usage struct { // what the gateway accounts for one request
     PromptTokens, CompletionTokens int
-    Estimated bool
+    Estimated bool // at least one count was estimated
 }
 ```
+
+The public API rejects request fields whose response data the gateway would drop while
+re-encoding chunks: `logprobs`, `top_logprobs`, `audio`, `modalities`, and the legacy
+`functions`/`function_call`. Other unknown fields go into `Extra`.
 
 ### 5.3 OpenAI-format adapter
 
 Nearly a passthrough. Upstream requests always set `stream: true` and
-`stream_options.include_usage: true`. If the client did not ask for usage, the
-usage-only final chunk is removed before forwarding, so the client sees standard
-OpenAI behavior. Chunks are parsed into `Chunk` and re-encoded. That decode/encode per
-chunk costs CPU; if Phase 7 shows it matters, we switch to forwarding the raw bytes for
-OpenAI→OpenAI and scanning only for `usage`.
+`stream_options.include_usage: true`; the usage-only final chunk is consumed by the
+adapter, and the gateway sends its own usage chunk only if the client asked for one.
+`Extra` is forwarded as is (known fields win on a name clash).
+
+The output cap is sent as `max_tokens` by default, which most OpenAI-compatible
+servers accept. A provider can set `max_tokens_field: max_completion_tokens` in the
+route table, which newer OpenAI models require.
+
+Chunks are parsed into `Chunk` and re-encoded. That decode/encode per chunk costs CPU;
+if Phase 7 shows it matters, we switch to forwarding the raw bytes for OpenAI→OpenAI
+and scanning only for `usage`.
 
 ### 5.4 Anthropic adapter (Messages API)
 
+The adapter calls the HTTP API directly with `anthropic-version: 2026-10-21` and
+`x-api-key`, not through the Go SDK. The gateway must own retries (the SDK retries 429
+and 5xx itself, which would hide failures from failover and the circuit breakers),
+point the adapter at any base URL (the mock), and see raw stream bytes for timing.
+
 | OpenAI (internal) | Anthropic |
 |---|---|
-| `system` messages | joined into top-level `system` |
+| `system` / `developer` messages | joined (blank line between) into top-level `system`, wherever they appear |
 | consecutive same-role messages | merged (Anthropic requires roles to alternate) |
-| `image_url` (data URI / https) | `image` block with `base64` / `url` source |
-| assistant `tool_calls[]` | assistant `tool_use` blocks `{id, name, input: parsed(arguments)}` |
-| `tool` message(s) | one `user` message of `tool_result` blocks `{tool_use_id, content}` |
-| `tools[].function{name,description,parameters}` | `tools[]{name, description, input_schema}` |
+| empty text parts | dropped (Anthropic rejects empty text blocks) |
+| `image_url` (base64 data URI / http(s) URL) | `image` block with `base64` / `url` source; other URLs are rejected |
+| assistant `tool_calls[]` | assistant `tool_use` blocks `{id, name, input: parsed(arguments)}`; arguments must be a JSON object |
+| `tool` message(s) | `tool_result` blocks `{tool_use_id, content}` in a `user` message |
+| `tools[].function{name,description,parameters,strict}` | `tools[]{name, description, input_schema, strict}`; no parameters → `{"type":"object","properties":{}}` |
 | `tool_choice`: `auto` / `none` / `required` / `{function:{name}}` | `{type:auto}` / `{type:none}` / `{type:any}` / `{type:tool,name}` |
-| `max_tokens` (optional) | `max_tokens` (required → alias default if absent) |
+| `parallel_tool_calls: false` | `disable_parallel_tool_use: true` on the tool choice |
+| `max_tokens` (optional) | `max_tokens` (required → always the effective cap) |
 | `stop` | `stop_sequences` |
-| `temperature` 0–2 | 0–1: values above 1 are rejected (`Supports` error), not silently clamped |
-| `n>1`, `logprobs`, `response_format` | unsupported → candidate filtered out at step 4 |
+| `user` | `metadata.user_id` |
+| `temperature`, `top_p` | API version 2026-10-21 rejects them on every model. The default value (1) means the same as omitting it, so it is accepted and not sent; any other value is rejected by `Supports` |
+| fields in `Extra` (e.g. `seed`, `response_format`) | rejected by `Supports` |
 
-Mapping the response and finish reason: `text` blocks → `content`; `tool_use` →
-`tool_calls` (with `arguments = json(input)`); `stop_reason` `end_turn`/`stop_sequence`
-→ `stop`, `max_tokens` → `length`, `tool_use` → `tool_calls`, `refusal` →
-`content_filter`.
+Forced tool choice (`required`, or a named function) is passed through as `any`/`tool`.
+The newest Claude models reject that with a 400, which reaches the client as
+`upstream_rejected`.
+
+Mapping the finish reason: `end_turn`/`stop_sequence`/`pause_turn` → `stop`,
+`max_tokens`/`model_context_window_exceeded` → `length`, `tool_use` → `tool_calls`,
+`refusal` → `content_filter`.
 
 Mapping stream events:
 
 | Anthropic event | Internal `Chunk` |
 |---|---|
-| `message_start` | `Role=assistant`; record `usage.input_tokens` (+ cache read/creation tokens) |
-| `content_block_start` (text) | nothing |
+| `message_start` | `Role=assistant`; record input usage = `input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`. The `output_tokens` here is provisional and ignored |
+| `content_block_start` (text) | nothing, unless it carries text |
 | `content_block_start` (tool_use) | `ToolCalls[{Index: k, ID, Name}]`, where k counts tool_use blocks |
+| `content_block_start` (thinking, redacted_thinking, others) | nothing; their deltas are skipped too |
 | `content_block_delta` `text_delta` | `Content` |
 | `content_block_delta` `input_json_delta` | `ToolCalls[{Index: k, ArgumentsFragment}]` |
-| `message_delta` | `FinishReason`; record cumulative `usage.output_tokens` |
-| `message_stop` | `Usage` chunk, then EOF |
-| `ping` | ignored |
-| `error` | `*UpstreamError` (e.g. `overloaded_error` → Retryable) |
+| `content_block_stop` of a tool_use with no input deltas | `ArgumentsFragment: "{}"`, so clients always get valid JSON |
+| `message_delta` | `FinishReason`; record the final `usage.output_tokens` |
+| `message_stop` | EOF |
+| `ping`, unknown event types | ignored (the API may add event types) |
+| `error` | `*UpstreamError` (`overloaded_error` → retryable server error) |
+
+Thinking content is never forwarded: OpenAI's format has no place for it, and on current
+models the API returns it empty by default anyway. Its tokens are still part of
+`output_tokens`, so they are billed. Because OpenAI-format clients cannot send thinking
+blocks back, multi-turn tool use reaches Anthropic without them. The live test
+(`make test-live`) checks that the API accepts such a history.
 
 Simplification: Anthropic cache-read and cache-write tokens are billed at the normal
 input price. Real Anthropic prices them differently, so this can overcharge relative to
@@ -257,13 +298,19 @@ the provider. It is listed as a non-guarantee.
 
 ### 5.5 Usage capture
 
-- If the provider reports usage (final OpenAI chunk, or Anthropic `message_start` +
-  `message_delta`), use it with `Estimated=false`.
-- If the stream ends without usage (provider omitted it, client disconnected,
-  mid-stream error), estimate it. Input comes from Anthropic's `message_start` if we got
-  one, otherwise from `est_in`. Output is `TokenEstimator` applied to the content and
-  tool arguments actually received. Set `Estimated=true` and persist the flag in the
-  ledger.
+- Each count the provider reports is used as is: the final OpenAI usage chunk, or
+  Anthropic's `message_start` (input) and `message_delta` (output).
+- Each count the provider does not report is estimated, and the usage is marked
+  `Estimated`. That happens when the provider omitted usage, the client disconnected,
+  or the stream failed mid-way. For an interrupted Anthropic stream this usually means
+  only the output count is estimated.
+- The estimator (`internal/estimate`) counts one token per 4 bytes of UTF-8. It counts
+  bytes, not characters, so multi-byte scripts are underestimated less. It adds 4
+  tokens per message and 3 per request, and counts `EST_IMAGE_TOKENS` per image
+  instead of the URL or base64 length. Input is estimated from the request; output from
+  the content and tool arguments the gateway actually received.
+- Clients see the flag as a gateway extension, `usage.estimated: true` (omitted when
+  false). The ledger will persist it (Phase 4).
 
 ## 6. Routing, health, and failover
 
@@ -327,10 +374,14 @@ after 2 successes.
 | Transport error, connect/TTFT timeout | yes | yes |
 | Upstream 5xx, Anthropic `overloaded_error` | yes | yes |
 | Upstream 429 | yes | yes |
-| Upstream 401/403 (our credentials are misconfigured) | yes | yes |
-| Upstream 400/404/422 (client's request is bad) | **no** | **no**: passed through to the client as 400 |
+| Upstream 401/402/403/404 (`KindConfig`: our credentials, account, or configured model) | yes | yes |
+| Upstream 400/413/422 and other 4xx (client's request is bad) | **no** | **no**: passed through to the client as 400 |
 | Mid-stream error / idle timeout after first chunk | yes | **no** (post-commit) |
 | Client cancel | no | — |
+
+404 counts as configuration, not a client error: clients name a gateway alias, and the
+upstream model ID comes from the route table. An upstream 404 is therefore the gateway's
+mistake, and another target may still serve the request (§14, D11).
 
 Health state lives in each gateway process (see §14, D3).
 
@@ -338,10 +389,13 @@ Health state lives in each gateway process (see §14, D3).
 
 **Commit point** is the moment the first byte goes to the client:
 
-- **Streaming:** when the first upstream chunk arrives and parses. Only then do we write
-  `200` + `text/event-stream` and that chunk. Before then the client has received
-  nothing, not even headers. We cannot send SSE keepalive comments before committing,
-  because they would commit the `200`.
+- **Streaming:** when the first upstream chunk that carries output arrives: content, a
+  tool call, or a finish reason. Role-only chunks before it (OpenAI's opening chunk,
+  Anthropic's `message_start`) are held back, so an upstream that accepts the request
+  but fails before producing anything is still a pre-commit failure (§14, D12). Only
+  then do we write `200` + `text/event-stream`, an opening role chunk, and that chunk.
+  Before then the client has received nothing, not even headers. We cannot send SSE
+  keepalive comments before committing, because they would commit the `200`.
 - **Non-streaming:** when the full JSON response is written. Any failure while
   aggregating counts as pre-commit, so a non-stream request can fail over even after the
   upstream produced tokens. The provider may bill for those tokens; we do not charge the
@@ -649,6 +703,11 @@ added in Phase 2 for adapter tests).
 - Rate limits are not enforced while Redis is down.
 - Revocation takes effect within `AUTH_CACHE_TTL`, not immediately.
 - Anthropic cache tokens are priced as normal input tokens.
+- Estimated counts come from a 4-bytes-per-token heuristic, not the provider's tokenizer.
+  How far off it is depends on the text. It is not measured here, because the mock's
+  tokenizer is synthetic.
+- Thinking content from Anthropic models is not forwarded, and OpenAI-format clients
+  cannot send thinking blocks back in later turns.
 - There is no client idempotency: a client retry is a new request and a new charge.
 
 **What the Phase 7 ledger chaos test can and can't show:** requests resolved by the
@@ -690,3 +749,12 @@ bench/results/        committed benchmark output
 | D6 | Dropped the separate `usage_captured` entry | Changes recommendation 2 | It has the same crash window as settle (§9). |
 | D7 | Settle **after** the last byte is flushed | New | Keeps a Postgres round trip off client latency; the crash window is covered by the reconciler. |
 | D8 | Money in integer nano-USD; prices in micro-USD per 1M tokens | New | Exact integer comparisons in `reconcile_check`. |
+
+Decided during Phase 2:
+
+| # | Decision | Reason |
+|---|---|---|
+| D9 | The Anthropic adapter calls the HTTP API directly, not through the Go SDK | The SDK's built-in retries would hide 429/5xx from failover and the breakers. The gateway also needs any base URL (the mock) and raw stream timing. Cost: we maintain the wire types ourselves; the mock enforces the 2026-10-21 rules to catch drift. |
+| D10 | Anthropic targets reject non-default `temperature`/`top_p` and unmodeled fields instead of dropping them | API version 2026-10-21 rejects sampling parameters on every model. Silently dropping a client's `temperature: 0.2` would change its output without telling it. Cost: clients that always send a non-default temperature (some SDK wrappers do) cannot use Anthropic targets until Phase 3, where `Supports` filters candidates and such requests route to OpenAI-format targets. |
+| D11 | Upstream 401/402/403/404 are configuration errors that allow failover | The client never names the upstream model, so these are the gateway's credentials, account, or route table, not the client's request. |
+| D12 | The streaming commit point is the first chunk with output, not the first chunk | An upstream that sends `message_start` and then fails can still be failed over. |

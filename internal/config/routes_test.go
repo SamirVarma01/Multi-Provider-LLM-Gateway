@@ -1,6 +1,7 @@
 package config
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -95,6 +96,19 @@ func TestMicroUSD(t *testing.T) {
 	for usd, want := range map[float64]int64{0.15: 150_000, 0.6: 600_000, 15: 15_000_000, 0: 0, 0.0000014: 1} {
 		if got := MicroUSD(usd); got != want {
 			t.Errorf("MicroUSD(%v) = %d, want %d", usd, got, want)
+		}
+	}
+}
+
+// TestRepoRouteFiles keeps the route tables shipped in config/ valid.
+func TestRepoRouteFiles(t *testing.T) {
+	files, err := filepath.Glob("../../config/*.yaml")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no route files found: %v", err)
+	}
+	for _, f := range files {
+		if _, err := LoadRoutes(f); err != nil {
+			t.Errorf("%s: %v", f, err)
 		}
 	}
 }

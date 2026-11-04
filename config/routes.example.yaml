@@ -1,0 +1,29 @@
+# Example route table for real providers. Copy it, set the API key env vars,
+# and point ROUTES_FILE at the copy. Prices are USD per 1M tokens; check each
+# provider's current price list before relying on them for budgets.
+providers:
+  - name: openai
+    format: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    # Newer OpenAI models reject max_tokens.
+    max_tokens_field: max_completion_tokens
+  - name: anthropic
+    format: anthropic
+    base_url: https://api.anthropic.com/v1
+    api_key_env: ANTHROPIC_API_KEY
+
+models:
+  - alias: claude-opus
+    default_max_output: 4096
+    candidates:
+      - { provider: anthropic, model: claude-opus-5-5, input_per_mtok: 4.00, output_per_mtok: 20.00, max_output: 128000 }
+  - alias: claude-haiku
+    default_max_output: 2048
+    candidates:
+      # Prompts up to 100K tokens; longer prompts are billed at a higher rate.
+      - { provider: anthropic, model: claude-haiku-5-5, input_per_mtok: 0.10, output_per_mtok: 0.50, max_output: 128000 }
+  # Add OpenAI models here with their current IDs and prices, e.g.:
+  # - alias: gpt
+  #   candidates:
+  #     - { provider: openai, model: <model-id>, input_per_mtok: <usd>, output_per_mtok: <usd>, max_output: <limit> }
