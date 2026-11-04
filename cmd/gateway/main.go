@@ -21,6 +21,7 @@ import (
 	"github.com/SamirVarma01/llm-gateway/internal/auth"
 	"github.com/SamirVarma01/llm-gateway/internal/config"
 	"github.com/SamirVarma01/llm-gateway/internal/db"
+	"github.com/SamirVarma01/llm-gateway/internal/estimate"
 	"github.com/SamirVarma01/llm-gateway/internal/httpapi"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
 	"github.com/SamirVarma01/llm-gateway/internal/router"
@@ -80,10 +81,11 @@ func run() error {
 
 	keys := auth.NewPGStore(pool)
 	api := httpapi.New(httpapi.Options{
-		Logger: logger,
-		Auth:   auth.NewCache(keys, cfg.AuthCacheTTL),
-		Keys:   keys,
-		Router: rt,
+		Logger:    logger,
+		Auth:      auth.NewCache(keys, cfg.AuthCacheTTL),
+		Keys:      keys,
+		Router:    rt,
+		Estimator: estimate.Estimator{ImageTokens: cfg.EstImageTokens},
 		Ready: []httpapi.ReadyCheck{
 			{Name: "postgres", Check: pool.Ping},
 			{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},

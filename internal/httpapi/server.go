@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/SamirVarma01/llm-gateway/internal/auth"
+	"github.com/SamirVarma01/llm-gateway/internal/estimate"
 	"github.com/SamirVarma01/llm-gateway/internal/oai"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
 	"github.com/SamirVarma01/llm-gateway/internal/router"
@@ -35,6 +36,7 @@ type Options struct {
 	Auth           auth.Lookuper
 	Keys           KeyAdmin
 	Router         *router.Router
+	Estimator      estimate.Estimator // fills in usage providers do not report
 	Ready          []ReadyCheck
 	AdminToken     string
 	RequestTimeout time.Duration
@@ -45,6 +47,8 @@ type Options struct {
 type Server struct {
 	opts Options
 	now  func() time.Time
+
+	onOutcome func(outcome) // test hook, called with every chat request's outcome
 }
 
 // New returns a Server.
