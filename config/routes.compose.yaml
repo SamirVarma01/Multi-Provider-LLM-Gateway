@@ -1,0 +1,14 @@
+# Route table for docker compose: two virtual providers on the mock service.
+providers:
+  - { name: mock-a, format: openai, base_url: "http://mock:9000/p/mock-a/v1" }
+  - { name: mock-b, format: openai, base_url: "http://mock:9000/p/mock-b/v1" }
+
+models:
+  - alias: mock-small
+    default_max_output: 256
+    candidates:
+      - { provider: mock-a, model: m-small, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 1, max_output: 4096 }
+      - { provider: mock-b, model: m-small, input_per_mtok: 0.20, output_per_mtok: 0.80, priority: 2, max_output: 4096 }
+  - alias: mock-large
+    candidates:
+      - { provider: mock-b, model: m-large, input_per_mtok: 3.00, output_per_mtok: 15.00, priority: 1, max_output: 8192 }

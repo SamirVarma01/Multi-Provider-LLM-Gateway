@@ -1,0 +1,69 @@
+name: llm-gateway
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: gateway
+      POSTGRES_PASSWORD: gateway
+      POSTGRES_DB: gateway
+    ports: ["127.0.0.1:${PG_PORT:-5432}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gateway -d gateway"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mock:
+    build: { context: ., args: { CMD: mockprovider } }
+    environment:
+      MOCK_ADDR: ":9000"
+      MOCK_TTFT_MS: ${MOCK_TTFT_MS:-50}
+      MOCK_TOKENS_PER_SEC: ${MOCK_TOKENS_PER_SEC:-100}
+      MOCK_OUTPUT_TOKENS: ${MOCK_OUTPUT_TOKENS:-32}
+      MOCK_USAGE_FILE: /data/usage.jsonl
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes: [mockdata:/data]
+    ports: ["127.0.0.1:${MOCK_PORT:-9000}:9000"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  gateway:
+    build: { context: ., args: { CMD: gateway } }
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      mock: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      ROUTES_FILE: /etc/gateway/routes.compose.yaml
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
+      - "127.0.0.1:${GATEWAY_ADMIN_PORT:-8081}:8081"
+    # Longer than SHUTDOWN_DRAIN_TIMEOUT so in-flight requests can drain.
+    stop_grace_period: 40s
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/readyz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  mockdata:
