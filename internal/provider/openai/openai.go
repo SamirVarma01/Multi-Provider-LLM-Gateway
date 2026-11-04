@@ -25,15 +25,29 @@ const maxErrorBody = 64 << 10
 
 // Provider calls an OpenAI-format API.
 type Provider struct {
-	name    string
-	baseURL string // up to and including /v1, e.g. https://api.openai.com/v1
-	apiKey  string
-	client  *http.Client
+	name                string
+	baseURL             string // up to and including /v1, e.g. https://api.openai.com/v1
+	apiKey              string
+	client              *http.Client
+	maxCompletionTokens bool
+}
+
+// Option configures a Provider.
+type Option func(*Provider)
+
+// UseMaxCompletionTokens sends the output limit as max_completion_tokens,
+// which newer OpenAI models require, instead of max_tokens.
+func UseMaxCompletionTokens() Option {
+	return func(p *Provider) { p.maxCompletionTokens = true }
 }
 
 // New returns an OpenAI-format provider. apiKey may be empty.
-func New(name, baseURL, apiKey string, client *http.Client) *Provider {
-	return &Provider{name: name, baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, client: client}
+func New(name, baseURL, apiKey string, client *http.Client, opts ...Option) *Provider {
+	p := &Provider{name: name, baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, client: client}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 // Name implements provider.Provider.
@@ -45,7 +59,11 @@ func (p *Provider) Supports(*provider.ChatRequest) error { return nil }
 
 // Stream implements provider.Provider.
 func (p *Provider) Stream(ctx context.Context, t provider.Target, req *provider.ChatRequest) (provider.Stream, error) {
-	body, err := json.Marshal(toWire(t, req))
+	w := toWire(t, req)
+	if p.maxCompletionTokens {
+		w.MaxCompletionTokens, w.MaxTokens = w.MaxTokens, nil
+	}
+	body, err := json.Marshal(w)
 	if err != nil {
 		return nil, fmt.Errorf("openai: encode request: %w", err)
 	}

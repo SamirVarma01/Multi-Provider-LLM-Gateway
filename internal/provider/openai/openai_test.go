@@ -370,3 +370,37 @@ func TestRequestMapping(t *testing.T) {
 		t.Errorf("wire request =\n%s", b)
 	}
 }
+
+func TestMaxCompletionTokensOption(t *testing.T) {
+	var body map[string]any
+	capture := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			raw, _ := io.ReadAll(r.Body)
+			body = nil
+			_ = json.Unmarshal(raw, &body)
+			r.Body = io.NopCloser(strings.NewReader(string(raw)))
+			next.ServeHTTP(w, r)
+		})
+	}
+	_, p := setup(t, mock.Behavior{OutputTokens: 100}, capture)
+	for _, opts := range [][]Option{nil, {UseMaxCompletionTokens()}} {
+		pp := New(p.name, p.baseURL, "", p.client, opts...)
+		s, err := pp.Stream(context.Background(), target, request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, _ := provider.Collect(s)
+		s.Close()
+		field, other := "max_tokens", "max_completion_tokens"
+		if opts != nil {
+			field, other = other, field
+		}
+		if body[field] != float64(64) || body[other] != nil {
+			t.Errorf("options %d: body = %v", len(opts), body)
+		}
+		// The mock honors either field.
+		if resp.Reported.CompletionTokens != 64 {
+			t.Errorf("options %d: completion tokens = %d", len(opts), resp.Reported.CompletionTokens)
+		}
+	}
+}

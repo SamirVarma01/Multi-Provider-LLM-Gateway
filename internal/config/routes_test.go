@@ -14,6 +14,10 @@ providers:
     format: openai
     base_url: http://mock:9000/p/mock-b/v1
     api_key_env: MOCK_B_KEY
+    max_tokens_field: max_completion_tokens
+  - name: claude
+    format: anthropic
+    base_url: https://api.anthropic.com/v1
 models:
   - alias: chat-small
     candidates:
@@ -30,7 +34,8 @@ func TestParseRoutes(t *testing.T) {
 	if m.Policy != PolicyPriority || m.DefaultMaxOutput != DefaultMaxOutput {
 		t.Errorf("defaults not applied: %+v", m)
 	}
-	if len(m.Candidates) != 2 || m.Candidates[1].Provider != "mock-b" || r.Providers[1].APIKeyEnv != "MOCK_B_KEY" {
+	if len(m.Candidates) != 2 || m.Candidates[1].Provider != "mock-b" || r.Providers[1].APIKeyEnv != "MOCK_B_KEY" ||
+		r.Providers[1].MaxTokensField != MaxCompletionTokensField || r.Providers[2].Format != FormatAnthropic {
 		t.Errorf("parsed = %+v", r)
 	}
 }
@@ -47,8 +52,9 @@ func TestParseRoutesErrors(t *testing.T) {
 		"many problems at once": {
 			yaml: `
 providers:
-  - { name: p, format: anthropic, base_url: "ftp://x" }
-  - { name: p, format: openai, base_url: "http://x/v1" }
+  - { name: p, format: gemini, base_url: "ftp://x" }
+  - { name: p, format: openai, base_url: "http://x/v1", max_tokens_field: tokens }
+  - { name: q, format: anthropic, base_url: "http://x/v1", max_tokens_field: max_tokens }
 models:
   - alias: a
     policy: fastest
@@ -58,7 +64,8 @@ models:
     candidates: []
 `,
 			want: []string{
-				`unsupported format "anthropic"`, "base_url", `duplicate name "p"`,
+				`unsupported format "gemini"`, "base_url", `duplicate name "p"`,
+				"max_tokens_field must be", "applies only to the openai format",
 				`unsupported policy "fastest"`, `unknown provider "nope"`, "model is required",
 				"prices must be", "max_output must be positive", `duplicate alias "a"`,
 				"at least one candidate",

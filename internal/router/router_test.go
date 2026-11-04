@@ -7,12 +7,14 @@ import (
 	"testing"
 
 	"github.com/SamirVarma01/llm-gateway/internal/config"
+	"github.com/SamirVarma01/llm-gateway/internal/provider/anthropic"
 )
 
 const routesYAML = `
 providers:
   - { name: mock-a, format: openai, base_url: "http://mock/p/mock-a/v1" }
   - { name: mock-b, format: openai, base_url: "http://mock/p/mock-b/v1", api_key_env: MOCK_B_KEY }
+  - { name: claude, format: anthropic, base_url: "http://mock/p/claude/v1" }
 models:
   - alias: chat
     default_max_output: 100
@@ -23,6 +25,9 @@ models:
   - alias: other
     candidates:
       - { provider: mock-a, model: x, max_output: 10 }
+  - alias: claude
+    candidates:
+      - { provider: claude, model: claude-test, max_output: 10 }
 `
 
 func build(t *testing.T, env map[string]string) (*Router, error) {
@@ -68,8 +73,12 @@ func TestResolve(t *testing.T) {
 	if _, err := r.Resolve("nope"); !errors.Is(err, ErrUnknownModel) {
 		t.Errorf("err = %v, want ErrUnknownModel", err)
 	}
-	if ms := r.Models(); len(ms) != 2 || ms[0].Alias != "chat" || ms[1].Alias != "other" {
+	if ms := r.Models(); len(ms) != 3 || ms[0].Alias != "chat" || ms[1].Alias != "other" {
 		t.Errorf("Models() = %v", ms)
+	}
+	c, _ := r.Resolve("claude")
+	if _, ok := c.Candidates[0].Provider.(*anthropic.Provider); !ok {
+		t.Errorf("anthropic-format provider built as %T", c.Candidates[0].Provider)
 	}
 }
 
