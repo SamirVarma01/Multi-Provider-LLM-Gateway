@@ -1,4 +1,4 @@
-.PHONY: build test test-integration vet up down logs smoke
+.PHONY: build test test-integration test-live vet up down logs smoke
 
 build:
 	go build ./...
@@ -11,8 +11,14 @@ test:
 test-integration:
 	REQUIRE_INTEGRATION=1 go test -race -count=1 ./...
 
+# Live provider tests: real API calls that cost money. Skipped unless
+# ANTHROPIC_API_KEY, or OPENAI_API_KEY and OPENAI_LIVE_MODEL, are set.
+test-live:
+	go test -tags live -run Live -count=1 -v ./internal/provider/...
+
 vet:
 	go vet ./...
+	go vet -tags live ./...
 
 up:
 	docker compose up -d --build --wait
