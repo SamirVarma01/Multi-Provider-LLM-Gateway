@@ -1,9 +1,10 @@
-// Package mock implements a deterministic, OpenAI-compatible LLM provider for
-// tests and benchmarks.
+// Package mock implements a deterministic LLM provider for tests and
+// benchmarks. It speaks two wire formats: OpenAI Chat Completions at
+// /p/{name}/v1/chat/completions and Anthropic Messages at /p/{name}/v1/messages.
 //
-// One server hosts any number of virtual providers at /p/{name}/v1/chat/completions,
-// each with its own Behavior (latency, decode rate, injected errors, mid-stream
-// failures, hangs). Output is a pure function of (seed, provider, request ID,
+// One server hosts any number of virtual providers, each with its own
+// Behavior (latency, decode rate, injected errors, mid-stream failures,
+// hangs). Output is a pure function of (seed, provider, request ID,
 // attempt), so repeated runs produce identical text and usage.
 //
 // Every request is recorded with the usage the mock reports, keyed by the
@@ -156,8 +157,10 @@ func New(opts Options) *Server {
 // Handler returns the HTTP handler serving all mock routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /p/{provider}/v1/chat/completions", s.handleChat)
-	mux.HandleFunc("POST /v1/chat/completions", s.handleChat)
+	mux.HandleFunc("POST /p/{provider}/v1/chat/completions", s.serve(openAIFormat{}))
+	mux.HandleFunc("POST /v1/chat/completions", s.serve(openAIFormat{}))
+	mux.HandleFunc("POST /p/{provider}/v1/messages", s.serve(anthropicFormat{}))
+	mux.HandleFunc("POST /v1/messages", s.serve(anthropicFormat{}))
 	mux.HandleFunc("GET /_mock/providers/{provider}", s.handleGetBehavior)
 	mux.HandleFunc("PUT /_mock/providers/{provider}", s.handlePutBehavior)
 	mux.HandleFunc("GET /_mock/usage", s.handleGetUsage)
@@ -248,90 +251,137 @@ func (s *Server) finish(c *call, outcome Outcome) {
 	s.addRecord(c.rec)
 }
 
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	provider := r.PathValue("provider")
-	if provider == "" {
-		provider = DefaultProvider
-	}
-	b := s.Behavior(provider)
-	if s.opts.AllowHeaderOverrides {
-		var err error
-		if b, err = applyHeaderOverrides(b, r.Header); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+// request is the format-neutral view of an incoming chat request.
+type request struct {
+	model        string
+	stream       bool
+	includeUsage bool // send usage in the stream (OpenAI: stream_options.include_usage)
+	outputLimit  *int
+	promptTokens int
+}
+
+// completion is what a response reports.
+type completion struct {
+	id           string
+	created      int64
+	model        string
+	text         string
+	truncated    bool // stopped at the output limit
+	promptTokens int
+	outputTokens int
+	withUsage    bool
+}
+
+// wireFormat is one provider API's request and response encoding. The shared
+// flow in serve decides timing, failures, and recording; a format only
+// encodes.
+type wireFormat interface {
+	parse(r *http.Request) (request, error)
+	writeError(w http.ResponseWriter, status int, msg string)
+	writeCompletion(w http.ResponseWriter, c completion)
+	streamer(sw *sse.Writer, c completion, includeUsage bool) streamer
+}
+
+// streamer writes one streamed response.
+type streamer interface {
+	start() error
+	token(i int, text string) error
+	// finish writes every event after the last token except the final one.
+	finish(outputTokens int) error
+	// done writes the final event.
+	done() error
+	midStreamError() error
+}
+
+func (s *Server) serve(f wireFormat) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		provider := r.PathValue("provider")
+		if provider == "" {
+			provider = DefaultProvider
+		}
+		b := s.Behavior(provider)
+		if s.opts.AllowHeaderOverrides {
+			var err error
+			if b, err = applyHeaderOverrides(b, r.Header); err != nil {
+				f.writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		req, err := f.parse(r)
+		if err != nil {
+			f.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-	}
 
-	var req oai.ChatCompletionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
-		return
-	}
-	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "messages must not be empty")
-		return
-	}
-
-	reqID := r.Header.Get(RequestIDHeader)
-	if reqID == "" {
-		reqID = uuid.NewString()
-	}
-	attempt := 1
-	if v := r.Header.Get(AttemptHeader); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			attempt = n
+		reqID := r.Header.Get(RequestIDHeader)
+		if reqID == "" {
+			reqID = uuid.NewString()
 		}
-	}
-
-	c := &call{rec: Record{
-		RequestID:    reqID,
-		Attempt:      attempt,
-		Provider:     provider,
-		Model:        req.Model,
-		Stream:       req.Stream,
-		PromptTokens: CountPromptTokens(req.Messages),
-		Status:       http.StatusOK,
-		StartedAt:    time.Now(),
-	}}
-	// Any exit not explicitly recorded (client gone, abort panic) is a cancellation.
-	defer s.finish(c, OutcomeClientCancelled)
-
-	rng := rand.New(rand.NewPCG(s.opts.Seed, seedFor(provider, reqID, attempt)))
-	injectError := b.ErrorRate > 0 && rng.Float64() < b.ErrorRate
-	n, finishReason := b.OutputTokens, "stop"
-	if lim := req.OutputLimit(); lim != nil && *lim < n {
-		n, finishReason = max(*lim, 0), "length"
-	}
-	tokens := generate(rng, n)
-
-	ctx := r.Context()
-	if b.Hang {
-		<-ctx.Done()
-		return
-	}
-	if injectError {
-		status := b.ErrorStatus
-		if status == 0 {
-			status = http.StatusInternalServerError
+		attempt := 1
+		if v := r.Header.Get(AttemptHeader); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				attempt = n
+			}
 		}
-		c.rec.Status = status
-		s.finish(c, OutcomeInjectedError)
-		writeError(w, status, "server_error", fmt.Sprintf("mock: injected error for provider %q", provider))
-		return
-	}
-	if err := sleepUntil(ctx, time.Now().Add(time.Duration(b.TTFTMs)*time.Millisecond)); err != nil {
-		return
-	}
 
-	if req.Stream {
-		s.stream(w, r, c, b, &req, tokens, finishReason)
-	} else {
-		s.complete(w, r, c, b, &req, tokens, finishReason)
+		c := &call{rec: Record{
+			RequestID:    reqID,
+			Attempt:      attempt,
+			Provider:     provider,
+			Model:        req.model,
+			Stream:       req.stream,
+			PromptTokens: req.promptTokens,
+			Status:       http.StatusOK,
+			StartedAt:    time.Now(),
+		}}
+		// Any exit not explicitly recorded (client gone, abort panic) is a cancellation.
+		defer s.finish(c, OutcomeClientCancelled)
+
+		rng := rand.New(rand.NewPCG(s.opts.Seed, seedFor(provider, reqID, attempt)))
+		injectError := b.ErrorRate > 0 && rng.Float64() < b.ErrorRate
+		n, truncated := b.OutputTokens, false
+		if lim := req.outputLimit; lim != nil && *lim < n {
+			n, truncated = max(*lim, 0), true
+		}
+		tokens := generate(rng, n)
+
+		ctx := r.Context()
+		if b.Hang {
+			<-ctx.Done()
+			return
+		}
+		if injectError {
+			status := b.ErrorStatus
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			c.rec.Status = status
+			s.finish(c, OutcomeInjectedError)
+			f.writeError(w, status, fmt.Sprintf("mock: injected error for provider %q", provider))
+			return
+		}
+		if err := sleepUntil(ctx, time.Now().Add(time.Duration(b.TTFTMs)*time.Millisecond)); err != nil {
+			return
+		}
+
+		comp := completion{
+			id:           "mock-" + reqID,
+			created:      time.Now().Unix(),
+			model:        req.model,
+			truncated:    truncated,
+			promptTokens: req.promptTokens,
+			withUsage:    !b.OmitUsage,
+		}
+		if req.stream {
+			s.stream(w, r, c, b, f.streamer(sse.NewWriter(w), comp, req.includeUsage), tokens)
+		} else {
+			s.complete(w, r, c, b, f, comp, tokens)
+		}
 	}
 }
 
 func (s *Server) complete(w http.ResponseWriter, r *http.Request, c *call, b Behavior,
-	req *oai.ChatCompletionRequest, tokens []string, finishReason string) {
+	f wireFormat, comp completion, tokens []string) {
 	ctx := r.Context()
 	start := time.Now()
 	if b.FailAfterTokens > 0 && b.FailAfterTokens <= len(tokens) {
@@ -345,45 +395,20 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, c *call, b Beh
 	if err := sleepUntil(ctx, tokenDue(start, len(tokens), b.TokensPerSec)); err != nil {
 		return
 	}
-
-	resp := oai.ChatCompletionResponse{
-		ID:      "chatcmpl-mock-" + c.rec.RequestID,
-		Object:  "chat.completion",
-		Created: start.Unix(),
-		Model:   req.Model,
-		Choices: []oai.Choice{{
-			Message:      oai.ResponseMessage{Role: "assistant", Content: strings.Join(tokens, "")},
-			FinishReason: finishReason,
-		}},
-	}
-	if !b.OmitUsage {
-		resp.Usage = usage(c.rec.PromptTokens, len(tokens))
-	}
+	comp.text = strings.Join(tokens, "")
+	comp.outputTokens = len(tokens)
 	c.rec.CompletionTokens = len(tokens)
 	s.finish(c, OutcomeComplete)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(resp)
+	f.writeCompletion(w, comp)
 }
 
-func (s *Server) stream(w http.ResponseWriter, r *http.Request, c *call, b Behavior,
-	req *oai.ChatCompletionRequest, tokens []string, finishReason string) {
+func (s *Server) stream(w http.ResponseWriter, r *http.Request, c *call, b Behavior, st streamer, tokens []string) {
 	ctx := r.Context()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	sw := sse.NewWriter(w)
 
-	id := "chatcmpl-mock-" + c.rec.RequestID
-	created := time.Now().Unix()
-	chunk := func(d oai.Delta, finish *string) oai.ChatCompletionChunk {
-		return oai.ChatCompletionChunk{
-			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []oai.ChunkChoice{{Delta: d, FinishReason: finish}},
-		}
-	}
-
-	empty := ""
-	if err := sw.JSON(chunk(oai.Delta{Role: "assistant", Content: &empty}, nil)); err != nil {
+	if err := st.start(); err != nil {
 		return
 	}
 	start := time.Now()
@@ -391,9 +416,7 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, c *call, b Behav
 		if b.FailAfterTokens > 0 && i == b.FailAfterTokens {
 			s.finish(c, OutcomeMidStreamFailure)
 			if b.FailMode == FailErrorEvent {
-				_ = sw.JSON(oai.ErrorBody{Error: oai.ErrorDetail{
-					Message: "mock: injected mid-stream failure", Type: "server_error",
-				}})
+				_ = st.midStreamError()
 				return
 			}
 			panic(http.ErrAbortHandler)
@@ -404,26 +427,16 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request, c *call, b Behav
 		if err := sleepUntil(ctx, tokenDue(start, i, b.TokensPerSec)); err != nil {
 			return
 		}
-		if err := sw.JSON(chunk(oai.Delta{Content: &tokens[i]}, nil)); err != nil {
+		if err := st.token(i, tokens[i]); err != nil {
 			return
 		}
 		c.rec.CompletionTokens = i + 1
 	}
-
-	if err := sw.JSON(chunk(oai.Delta{}, &finishReason)); err != nil {
+	if err := st.finish(len(tokens)); err != nil {
 		return
 	}
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage && !b.OmitUsage {
-		u := oai.ChatCompletionChunk{
-			ID: id, Object: "chat.completion.chunk", Created: created, Model: req.Model,
-			Choices: []oai.ChunkChoice{}, Usage: usage(c.rec.PromptTokens, len(tokens)),
-		}
-		if err := sw.JSON(u); err != nil {
-			return
-		}
-	}
 	s.finish(c, OutcomeComplete)
-	_ = sw.Data([]byte(oai.DoneData))
+	_ = st.done()
 }
 
 func (s *Server) handleGetBehavior(w http.ResponseWriter, r *http.Request) {
@@ -460,17 +473,6 @@ func (s *Server) handleDeleteUsage(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// CountPromptTokens is the mock's tokenizer: whitespace-separated words plus a
-// fixed per-message overhead. It deliberately differs from the gateway's
-// character-based estimator, so tests can tell reported usage from estimates.
-func CountPromptTokens(msgs []oai.Message) int {
-	n := 3
-	for _, m := range msgs {
-		n += 3 + len(strings.Fields(m.Content.String()))
-	}
-	return n
-}
-
 var vocabulary = strings.Fields(`the a gateway token stream model route budget ledger
 	provider latency request response cache circuit breaker failover reserve settle
 	release usage price health window bucket limit chunk event mock alpha beta gamma
@@ -495,10 +497,6 @@ func seedFor(provider, requestID string, attempt int) uint64 {
 	h := fnv.New64a()
 	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%d", provider, requestID, attempt)
 	return h.Sum64()
-}
-
-func usage(prompt, completion int) *oai.Usage {
-	return &oai.Usage{PromptTokens: prompt, CompletionTokens: completion, TotalTokens: prompt + completion}
 }
 
 // tokenDue is when token i (0-based) should be emitted. The first token goes
@@ -579,6 +577,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError writes an OpenAI-shaped error; the control endpoints use it.
 func writeError(w http.ResponseWriter, status int, typ, msg string) {
 	writeJSON(w, status, oai.ErrorBody{Error: oai.ErrorDetail{Message: msg, Type: typ}})
 }

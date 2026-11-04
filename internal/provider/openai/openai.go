@@ -25,27 +25,45 @@ const maxErrorBody = 64 << 10
 
 // Provider calls an OpenAI-format API.
 type Provider struct {
-	name    string
-	baseURL string // up to and including /v1, e.g. https://api.openai.com/v1
-	apiKey  string
-	client  *http.Client
+	name                string
+	baseURL             string // up to and including /v1, e.g. https://api.openai.com/v1
+	apiKey              string
+	client              *http.Client
+	maxCompletionTokens bool
+}
+
+// Option configures a Provider.
+type Option func(*Provider)
+
+// UseMaxCompletionTokens sends the output limit as max_completion_tokens,
+// which newer OpenAI models require, instead of max_tokens.
+func UseMaxCompletionTokens() Option {
+	return func(p *Provider) { p.maxCompletionTokens = true }
 }
 
 // New returns an OpenAI-format provider. apiKey may be empty.
-func New(name, baseURL, apiKey string, client *http.Client) *Provider {
-	return &Provider{name: name, baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, client: client}
+func New(name, baseURL, apiKey string, client *http.Client, opts ...Option) *Provider {
+	p := &Provider{name: name, baseURL: strings.TrimSuffix(baseURL, "/"), apiKey: apiKey, client: client}
+	for _, o := range opts {
+		o(p)
+	}
+	return p
 }
 
 // Name implements provider.Provider.
 func (p *Provider) Name() string { return p.name }
 
-// Supports implements provider.Provider. Every request the gateway accepts
-// today is expressible in OpenAI format.
+// Supports implements provider.Provider. The internal format is OpenAI's, so
+// every request is expressible, including unmodeled fields in Extra.
 func (p *Provider) Supports(*provider.ChatRequest) error { return nil }
 
 // Stream implements provider.Provider.
 func (p *Provider) Stream(ctx context.Context, t provider.Target, req *provider.ChatRequest) (provider.Stream, error) {
-	body, err := json.Marshal(toWire(t, req))
+	w := toWire(t, req)
+	if p.maxCompletionTokens {
+		w.MaxCompletionTokens, w.MaxTokens = w.MaxTokens, nil
+	}
+	body, err := json.Marshal(w)
 	if err != nil {
 		return nil, fmt.Errorf("openai: encode request: %w", err)
 	}
@@ -77,31 +95,59 @@ func (p *Provider) Stream(ctx context.Context, t provider.Target, req *provider.
 }
 
 func toWire(t provider.Target, req *provider.ChatRequest) oai.ChatCompletionRequest {
-	msgs := make([]oai.Message, len(req.Messages))
-	for i, m := range req.Messages {
-		msgs[i] = oai.Message{Role: string(m.Role)}
-		if len(m.Content) == 1 {
-			msgs[i].Content = oai.TextContent(m.Content[0].Text)
-			continue
-		}
-		parts := make([]oai.ContentPart, len(m.Content))
-		for j, p := range m.Content {
-			parts[j] = oai.ContentPart{Type: p.Type, Text: p.Text}
-		}
-		msgs[i].Content = oai.Content{Parts: parts}
-	}
-	return oai.ChatCompletionRequest{
-		Model:       t.UpstreamModel,
-		Messages:    msgs,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stop:        req.Stop,
-		User:        req.User,
+	w := oai.ChatCompletionRequest{
+		Model:             t.UpstreamModel,
+		Messages:          make([]oai.Message, len(req.Messages)),
+		MaxTokens:         req.MaxTokens,
+		Temperature:       req.Temperature,
+		TopP:              req.TopP,
+		Stop:              req.Stop,
+		ParallelToolCalls: req.ParallelToolCalls,
+		User:              req.User,
+		Extra:             req.Extra,
 		// Always stream upstream and always ask for usage (design §5.3).
 		Stream:        true,
 		StreamOptions: &oai.StreamOptions{IncludeUsage: true},
 	}
+	for i, m := range req.Messages {
+		w.Messages[i] = messageToWire(m)
+	}
+	for _, tool := range req.Tools {
+		w.Tools = append(w.Tools, oai.Tool{Type: "function", Function: oai.FunctionSpec{
+			Name: tool.Name, Description: tool.Description, Parameters: tool.Parameters, Strict: tool.Strict,
+		}})
+	}
+	if tc := req.ToolChoice; tc != nil {
+		w.ToolChoice = &oai.ToolChoice{Mode: tc.Mode, Function: tc.Name}
+	}
+	return w
+}
+
+func messageToWire(m provider.Message) oai.Message {
+	out := oai.Message{Role: string(m.Role), ToolCallID: m.ToolCallID}
+	for _, tc := range m.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, oai.ToolCall{
+			ID: tc.ID, Type: "function", Function: oai.FunctionCall{Name: tc.Name, Arguments: tc.Arguments},
+		})
+	}
+	switch {
+	case len(m.Content) == 0 && len(m.ToolCalls) > 0:
+		out.Content = oai.Content{Null: true}
+	case len(m.Content) == 1 && m.Content[0].Type == provider.PartText:
+		out.Content = oai.TextContent(m.Content[0].Text)
+	default:
+		parts := make([]oai.ContentPart, 0, len(m.Content))
+		for _, p := range m.Content {
+			if p.Type == provider.PartImage {
+				parts = append(parts, oai.ContentPart{Type: "image_url",
+					ImageURL: &oai.ImageURL{URL: p.ImageURL, Detail: p.ImageDetail}})
+				continue
+			}
+			parts = append(parts, oai.ContentPart{Type: "text", Text: p.Text})
+		}
+		out.Content = oai.Content{Parts: parts}
+	}
+	return out
 }
 
 // transportError classifies a failure to get or read a response. A caller
@@ -136,8 +182,7 @@ type stream struct {
 
 	err      error // sticky terminal error (io.EOF on clean end)
 	finished bool  // a finish_reason has been seen
-	usage    provider.Usage
-	usageOK  bool
+	usage    provider.Reported
 
 	closeOnce sync.Once
 }
@@ -175,19 +220,27 @@ func (s *stream) Recv() (*provider.Chunk, error) {
 			if ch.Delta.Content != nil {
 				out.Content = *ch.Delta.Content
 			}
+			for _, d := range ch.Delta.ToolCalls {
+				td := provider.ToolCallDelta{Index: d.Index, ID: d.ID}
+				if d.Function != nil {
+					td.Name = d.Function.Name
+					td.ArgumentsFragment = d.Function.Arguments
+				}
+				out.ToolCalls = append(out.ToolCalls, td)
+			}
 			if ch.FinishReason != nil {
 				out.FinishReason = *ch.FinishReason
 				s.finished = true
 			}
 		}
 		if c.Usage != nil {
-			s.usage = provider.Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens}
-			s.usageOK = true
-			u := s.usage
-			out.Usage = &u
+			s.usage = provider.Reported{
+				PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens,
+				HasPrompt: true, HasCompletion: true,
+			}
 		}
-		if out == (provider.Chunk{}) {
-			continue // e.g. an empty keepalive chunk
+		if out.Role == "" && !out.HasOutput() {
+			continue // the usage-only final chunk, or an empty keepalive
 		}
 		return &out, nil
 	}
@@ -208,7 +261,7 @@ func (s *stream) readError(err error) error {
 	return s.p.transportError(s.ctx, err)
 }
 
-func (s *stream) Usage() (provider.Usage, bool) { return s.usage, s.usageOK }
+func (s *stream) Usage() provider.Reported { return s.usage }
 
 func (s *stream) Close() error {
 	var err error

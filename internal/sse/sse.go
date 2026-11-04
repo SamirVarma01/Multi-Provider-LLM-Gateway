@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // MaxLineBytes bounds a single SSE line (one serialized chunk).
@@ -89,10 +90,22 @@ func NewWriter(w http.ResponseWriter) *Writer {
 
 // Data writes one "data:" event and flushes it. data must not contain newlines.
 func (w *Writer) Data(data []byte) error {
-	if bytes.IndexByte(data, '\n') >= 0 {
-		return errors.New("sse: data contains a newline")
+	return w.Event("", data)
+}
+
+// Event writes one event with an "event:" type line (omitted when name is
+// empty) and flushes it. Neither argument may contain newlines.
+func (w *Writer) Event(name string, data []byte) error {
+	if bytes.IndexByte(data, '\n') >= 0 || strings.IndexByte(name, '\n') >= 0 {
+		return errors.New("sse: event contains a newline")
 	}
-	w.buf = append(w.buf[:0], "data: "...)
+	w.buf = w.buf[:0]
+	if name != "" {
+		w.buf = append(w.buf, "event: "...)
+		w.buf = append(w.buf, name...)
+		w.buf = append(w.buf, '\n')
+	}
+	w.buf = append(w.buf, "data: "...)
 	w.buf = append(w.buf, data...)
 	w.buf = append(w.buf, '\n', '\n')
 	if _, err := w.w.Write(w.buf); err != nil {
@@ -103,9 +116,14 @@ func (w *Writer) Data(data []byte) error {
 
 // JSON marshals v and writes it as one event.
 func (w *Writer) JSON(v any) error {
+	return w.EventJSON("", v)
+}
+
+// EventJSON marshals v and writes it as one event of the given type.
+func (w *Writer) EventJSON(name string, v any) error {
 	b, err := json.Marshal(v) // compact: never contains raw newlines
 	if err != nil {
 		return err
 	}
-	return w.Data(b)
+	return w.Event(name, b)
 }

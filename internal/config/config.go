@@ -28,6 +28,8 @@ type Config struct {
 	RequestTimeout       time.Duration // REQUEST_TIMEOUT
 	ShutdownDrainTimeout time.Duration // SHUTDOWN_DRAIN_TIMEOUT
 	MaxBodyBytes         int64         // MAX_BODY_BYTES
+
+	EstImageTokens int // EST_IMAGE_TOKENS: tokens assumed per input image when estimating
 }
 
 // FromEnv loads Config from the process environment.
@@ -52,12 +54,16 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RequestTimeout:       r.duration("REQUEST_TIMEOUT", 10*time.Minute),
 		ShutdownDrainTimeout: r.duration("SHUTDOWN_DRAIN_TIMEOUT", 30*time.Second),
 		MaxBodyBytes:         r.int64("MAX_BODY_BYTES", 4<<20),
+		EstImageTokens:       int(r.int64("EST_IMAGE_TOKENS", 1000)),
 	}
 	if cfg.RequestTimeout <= 0 {
 		r.errs = append(r.errs, errors.New("REQUEST_TIMEOUT must be positive"))
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		r.errs = append(r.errs, errors.New("MAX_BODY_BYTES must be positive"))
+	}
+	if cfg.EstImageTokens < 0 {
+		r.errs = append(r.errs, errors.New("EST_IMAGE_TOKENS must be >= 0"))
 	}
 	if err := errors.Join(r.errs...); err != nil {
 		return Config{}, fmt.Errorf("config: %w", err)

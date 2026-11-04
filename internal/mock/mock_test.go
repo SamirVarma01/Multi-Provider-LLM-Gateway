@@ -146,13 +146,13 @@ func TestNonStreamingIsDeterministicAndRecorded(t *testing.T) {
 	}
 	a1, a2, b := get("req-a"), get("req-a"), get("req-b")
 
-	if a1.Choices[0].Message.Content != a2.Choices[0].Message.Content {
+	if *a1.Choices[0].Message.Content != *a2.Choices[0].Message.Content {
 		t.Error("same request ID produced different output")
 	}
-	if a1.Choices[0].Message.Content == b.Choices[0].Message.Content {
+	if *a1.Choices[0].Message.Content == *b.Choices[0].Message.Content {
 		t.Error("different request IDs produced identical output")
 	}
-	if got := len(strings.Fields(a1.Choices[0].Message.Content)); got != 12 {
+	if got := len(strings.Fields(*a1.Choices[0].Message.Content)); got != 12 {
 		t.Errorf("content has %d words, want 12", got)
 	}
 	// "hello there mock" = 3 words; 3 per message + 3 priming.
@@ -195,8 +195,8 @@ func TestStreamingMatchesNonStreaming(t *testing.T) {
 	var ns oai.ChatCompletionResponse
 	_ = json.NewDecoder(resp.Body).Decode(&ns)
 	resp.Body.Close()
-	if ns.Choices[0].Message.Content != got.content {
-		t.Errorf("stream content %q != non-stream %q for the same attempt", got.content, ns.Choices[0].Message.Content)
+	if *ns.Choices[0].Message.Content != got.content {
+		t.Errorf("stream content %q != non-stream %q for the same attempt", got.content, *ns.Choices[0].Message.Content)
 	}
 
 	r := s.Records("req-1")[0]

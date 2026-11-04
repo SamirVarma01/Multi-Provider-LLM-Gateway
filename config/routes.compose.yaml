@@ -2,6 +2,7 @@
 providers:
   - { name: mock-a, format: openai, base_url: "http://mock:9000/p/mock-a/v1" }
   - { name: mock-b, format: openai, base_url: "http://mock:9000/p/mock-b/v1" }
+  - { name: mock-claude, format: anthropic, base_url: "http://mock:9000/p/mock-claude/v1" }
 
 models:
   - alias: mock-small
@@ -12,3 +13,6 @@ models:
   - alias: mock-large
     candidates:
       - { provider: mock-b, model: m-large, input_per_mtok: 3.00, output_per_mtok: 15.00, priority: 1, max_output: 8192 }
+  - alias: mock-claude
+    candidates:
+      - { provider: mock-claude, model: claude-mock, input_per_mtok: 3.00, output_per_mtok: 15.00, priority: 1, max_output: 8192 }

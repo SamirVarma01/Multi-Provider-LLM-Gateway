@@ -17,6 +17,7 @@ import (
 
 	"github.com/SamirVarma01/llm-gateway/internal/auth"
 	"github.com/SamirVarma01/llm-gateway/internal/config"
+	"github.com/SamirVarma01/llm-gateway/internal/estimate"
 	"github.com/SamirVarma01/llm-gateway/internal/mock"
 	"github.com/SamirVarma01/llm-gateway/internal/oai"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
@@ -42,23 +43,20 @@ func (s staticAuth) LookupByHash(_ context.Context, hash []byte) (auth.Key, erro
 }
 
 type testEnv struct {
-	mock   *mock.Server
-	public *httptest.Server
-	admin  *httptest.Server
-	key    string
+	mock     *mock.Server
+	public   *httptest.Server
+	admin    *httptest.Server
+	key      string
+	outcomes chan outcome
 }
 
-// newEnv starts a mock provider and a gateway in front of it. Aliases:
-// "chat" (default_max_output 64, max_output 1000) and "tiny" (max_output 5).
-func newEnv(t *testing.T, b mock.Behavior, tweak func(*Options)) *testEnv {
-	t.Helper()
-	m := mock.New(mock.Options{Defaults: b, Seed: 3})
-	mockTS := httptest.NewServer(m.Handler())
-	t.Cleanup(mockTS.Close)
-
-	routes, err := config.ParseRoutes([]byte(fmt.Sprintf(`
+// mockRoutes is the route table newEnv serves, with %[1]s the mock's URL.
+// "chat" (OpenAI format, default_max_output 64, max_output 1000), "tiny"
+// (max_output 5), and "claude" (Anthropic format).
+const mockRoutes = `
 providers:
-  - { name: mock-a, format: openai, base_url: "%s/p/mock-a/v1" }
+  - { name: mock-a, format: openai, base_url: "%[1]s/p/mock-a/v1" }
+  - { name: claude-a, format: anthropic, base_url: "%[1]s/p/claude-a/v1" }
 models:
   - alias: chat
     default_max_output: 64
@@ -67,7 +65,27 @@ models:
   - alias: tiny
     candidates:
       - { provider: mock-a, model: m-tiny, input_per_mtok: 1, output_per_mtok: 2, max_output: 5 }
-`, mockTS.URL)))
+  - alias: claude
+    default_max_output: 64
+    candidates:
+      - { provider: claude-a, model: claude-test, input_per_mtok: 3, output_per_mtok: 15, max_output: 1000 }
+`
+
+// newEnv starts a mock provider and a gateway in front of it (see mockRoutes).
+func newEnv(t *testing.T, b mock.Behavior, tweak func(*Options)) *testEnv {
+	t.Helper()
+	m := mock.New(mock.Options{Defaults: b, Seed: 3})
+	mockTS := httptest.NewServer(m.Handler())
+	t.Cleanup(mockTS.Close)
+	e := newEnvRoutes(t, fmt.Sprintf(mockRoutes, mockTS.URL), tweak)
+	e.mock = m
+	return e
+}
+
+// newEnvRoutes starts a gateway serving the given route table.
+func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEnv {
+	t.Helper()
+	routes, err := config.ParseRoutes([]byte(routesYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +105,7 @@ models:
 		Logger:         obs.NewLogger(io.Discard, 0),
 		Auth:           staticAuth{plaintext: key, key: auth.Key{ID: uuid.New(), Name: "test"}},
 		Router:         rt,
+		Estimator:      estimate.Estimator{ImageTokens: 100},
 		AdminToken:     adminToken,
 		RequestTimeout: 10 * time.Second,
 		MaxBodyBytes:   1 << 20,
@@ -95,11 +114,30 @@ models:
 		tweak(&opts)
 	}
 	srv := New(opts)
+	outcomes := make(chan outcome, 64)
+	srv.onOutcome = func(o outcome) {
+		select {
+		case outcomes <- o:
+		default: // a test that does not read outcomes must not block handlers
+		}
+	}
 	public := httptest.NewServer(srv.PublicHandler())
 	t.Cleanup(public.Close)
 	admin := httptest.NewServer(srv.AdminHandler())
 	t.Cleanup(admin.Close)
-	return &testEnv{mock: m, public: public, admin: admin, key: key}
+	return &testEnv{public: public, admin: admin, key: key, outcomes: outcomes}
+}
+
+// outcome waits for the next request outcome.
+func (e *testEnv) outcome(t *testing.T) outcome {
+	t.Helper()
+	select {
+	case o := <-e.outcomes:
+		return o
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request outcome within 5s")
+		return outcome{}
+	}
 }
 
 func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.Response {
@@ -200,7 +238,7 @@ func TestChatHappyPath(t *testing.T) {
 		t.Errorf("usage = %+v, mock recorded %+v", out.Usage, rec)
 	}
 	msg := out.Choices[0]
-	if msg.Message.Role != "assistant" || len(strings.Fields(msg.Message.Content)) != 12 || msg.FinishReason != "stop" {
+	if msg.Message.Role != "assistant" || len(strings.Fields(*msg.Message.Content)) != 12 || msg.FinishReason != "stop" {
 		t.Errorf("choice = %+v", msg)
 	}
 }
@@ -221,7 +259,7 @@ func TestChatRequiresAuth(t *testing.T) {
 
 func TestChatValidation(t *testing.T) {
 	e := newEnv(t, mock.Behavior{OutputTokens: 1}, func(o *Options) { o.MaxBodyBytes = 4096 })
-	two, zero, hot := 2, 0, 3.0
+	two, zero, hot, half := 2, 0, 3.0, 0.5
 	mut := func(f func(*oai.ChatCompletionRequest)) oai.ChatCompletionRequest {
 		r := chatReq("chat", nil)
 		f(&r)
@@ -236,14 +274,27 @@ func TestChatValidation(t *testing.T) {
 		{"invalid json", `{"model":`, 400, "invalid_json"},
 		{"missing model", mut(func(r *oai.ChatCompletionRequest) { r.Model = "" }), 400, "missing_model"},
 		{"no messages", mut(func(r *oai.ChatCompletionRequest) { r.Messages = nil }), 400, "missing_messages"},
-		{"stream", mut(func(r *oai.ChatCompletionRequest) { r.Stream = true }), 400, "unsupported_parameter"},
+		{"logprobs", `{"model":"chat","messages":[{"role":"user","content":"x"}],"logprobs":true}`, 400, "unsupported_parameter"},
 		{"n=2", mut(func(r *oai.ChatCompletionRequest) { r.N = &two }), 400, "unsupported_parameter"},
 		{"max_tokens 0", mut(func(r *oai.ChatCompletionRequest) { r.MaxTokens = &zero }), 400, "invalid_max_tokens"},
 		{"temperature", mut(func(r *oai.ChatCompletionRequest) { r.Temperature = &hot }), 400, "invalid_temperature"},
-		{"tool role", mut(func(r *oai.ChatCompletionRequest) { r.Messages[0].Role = "tool" }), 400, "unsupported_role"},
-		{"image part", mut(func(r *oai.ChatCompletionRequest) {
+		{"unknown role", mut(func(r *oai.ChatCompletionRequest) { r.Messages[0].Role = "narrator" }), 400, "unsupported_role"},
+		{"tool message without tool_call_id", mut(func(r *oai.ChatCompletionRequest) { r.Messages[0].Role = "tool" }), 400, "missing_tool_call_id"},
+		{"image part without url", mut(func(r *oai.ChatCompletionRequest) {
 			r.Messages[1].Content.Parts[0].Type = "image_url"
+		}), 400, "invalid_content"},
+		{"audio part", mut(func(r *oai.ChatCompletionRequest) {
+			r.Messages[1].Content.Parts[0].Type = "input_audio"
 		}), 400, "unsupported_content"},
+		{"null user content", `{"model":"chat","messages":[{"role":"user","content":null}]}`, 400, "missing_content"},
+		{"tool_choice names an undeclared tool", `{"model":"chat","messages":[{"role":"user","content":"x"}],
+			"tools":[{"type":"function","function":{"name":"a"}}],"tool_choice":{"type":"function","function":{"name":"b"}}}`,
+			400, "invalid_tool_choice"},
+		{"tool without name", `{"model":"chat","messages":[{"role":"user","content":"x"}],
+			"tools":[{"type":"function","function":{}}]}`, 400, "invalid_tools"},
+		{"anthropic target with temperature", mut(func(r *oai.ChatCompletionRequest) {
+			r.Model, r.Temperature = "claude", &half
+		}), 400, "unsupported_request"},
 		{"unknown model", chatReq("gpt-nope", nil), 404, "model_not_found"},
 		{"too large", mut(func(r *oai.ChatCompletionRequest) {
 			r.Messages[1].Content = oai.TextContent(strings.Repeat("x", 5000))
@@ -311,7 +362,7 @@ func TestModels(t *testing.T) {
 	e := newEnv(t, mock.Behavior{}, nil)
 	resp := e.do(t, http.MethodGet, e.public.URL+"/v1/models", e.key, nil)
 	out := decode[modelList](t, resp)
-	if out.Object != "list" || len(out.Data) != 2 {
+	if out.Object != "list" || len(out.Data) != 3 {
 		t.Fatalf("models = %+v", out)
 	}
 	m := out.Data[0]

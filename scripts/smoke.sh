@@ -23,3 +23,9 @@ curl -fsS -D - "$GATEWAY/v1/chat/completions" \
   -H "Authorization: Bearer $key" \
   -H "Content-Type: application/json" \
   -d '{"model":"mock-small","messages":[{"role":"user","content":"hello gateway"}],"max_tokens":16}'
+echo
+echo "--- POST /v1/chat/completions (stream, Anthropic-format mock)"
+curl -fsS -N "$GATEWAY/v1/chat/completions" \
+  -H "Authorization: Bearer $key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mock-claude","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello gateway"}],"max_tokens":5}'

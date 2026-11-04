@@ -12,6 +12,7 @@ import (
 
 	"github.com/SamirVarma01/llm-gateway/internal/config"
 	"github.com/SamirVarma01/llm-gateway/internal/provider"
+	"github.com/SamirVarma01/llm-gateway/internal/provider/anthropic"
 	"github.com/SamirVarma01/llm-gateway/internal/provider/openai"
 )
 
@@ -66,7 +67,13 @@ func BuildProviders(routes config.Routes, client *http.Client, lookupEnv func(st
 		}
 		switch p.Format {
 		case config.FormatOpenAI:
-			out[p.Name] = openai.New(p.Name, p.BaseURL, key, client)
+			var opts []openai.Option
+			if p.MaxTokensField == config.MaxCompletionTokensField {
+				opts = append(opts, openai.UseMaxCompletionTokens())
+			}
+			out[p.Name] = openai.New(p.Name, p.BaseURL, key, client, opts...)
+		case config.FormatAnthropic:
+			out[p.Name] = anthropic.New(p.Name, p.BaseURL, key, client)
 		default:
 			return nil, fmt.Errorf("router: provider %q: unsupported format %q", p.Name, p.Format)
 		}

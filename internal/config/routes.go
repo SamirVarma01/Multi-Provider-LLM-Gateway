@@ -13,7 +13,14 @@ import (
 
 // Provider formats the gateway can speak.
 const (
-	FormatOpenAI = "openai"
+	FormatOpenAI    = "openai"
+	FormatAnthropic = "anthropic"
+)
+
+// Output-limit field names an OpenAI-format provider may require.
+const (
+	MaxTokensField           = "max_tokens"
+	MaxCompletionTokensField = "max_completion_tokens"
 )
 
 // Routing policies. Phase 1 implements only priority order.
@@ -36,6 +43,11 @@ type ProviderSpec struct {
 	Format    string `yaml:"format"`
 	BaseURL   string `yaml:"base_url"`    // up to and including /v1
 	APIKeyEnv string `yaml:"api_key_env"` // optional env var holding the API key
+	// MaxTokensField is the request field carrying the output limit for
+	// OpenAI-format providers: max_tokens (default, accepted by most
+	// compatible servers) or max_completion_tokens (required by newer
+	// OpenAI models).
+	MaxTokensField string `yaml:"max_tokens_field"`
 }
 
 // ModelSpec is one public model alias.
@@ -103,7 +115,16 @@ func (r Routes) Validate() error {
 			add("providers[%d]: duplicate name %q", i, p.Name)
 		}
 		providers[p.Name] = true
-		if p.Format != FormatOpenAI {
+		switch p.Format {
+		case FormatOpenAI:
+			if f := p.MaxTokensField; f != "" && f != MaxTokensField && f != MaxCompletionTokensField {
+				add("provider %q: max_tokens_field must be %q or %q", p.Name, MaxTokensField, MaxCompletionTokensField)
+			}
+		case FormatAnthropic:
+			if p.MaxTokensField != "" {
+				add("provider %q: max_tokens_field applies only to the openai format", p.Name)
+			}
+		default:
 			add("provider %q: unsupported format %q", p.Name, p.Format)
 		}
 		if u, err := url.Parse(p.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
