@@ -94,11 +94,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}},
 	}
 	// Phase 2 estimates usage when the provider omits it; until then it is left out.
-	if resp.UsageReported {
+	rep := resp.Reported
+	if rep.HasPrompt && rep.HasCompletion {
 		out.Usage = &oai.Usage{
-			PromptTokens:     resp.Usage.PromptTokens,
-			CompletionTokens: resp.Usage.CompletionTokens,
-			TotalTokens:      resp.Usage.PromptTokens + resp.Usage.CompletionTokens,
+			PromptTokens:     rep.PromptTokens,
+			CompletionTokens: rep.CompletionTokens,
+			TotalTokens:      rep.PromptTokens + rep.CompletionTokens,
 		}
 	}
 	w.Header().Set(headerProvider, cand.Target.Provider)
@@ -109,9 +110,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"model", body.Model,
 		"provider", cand.Target.Provider,
 		"upstream_model", cand.Target.UpstreamModel,
-		"prompt_tokens", resp.Usage.PromptTokens,
-		"completion_tokens", resp.Usage.CompletionTokens,
-		"usage_reported", resp.UsageReported,
+		"prompt_tokens", rep.PromptTokens,
+		"completion_tokens", rep.CompletionTokens,
+		"usage_reported", rep.HasPrompt && rep.HasCompletion,
 		"finish_reason", resp.FinishReason,
 		"upstream_duration", upstreamDur,
 	)
