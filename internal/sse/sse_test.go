@@ -58,7 +58,10 @@ func TestWriter(t *testing.T) {
 	if err := w.Data([]byte("a\nb")); err == nil {
 		t.Error("Data with a raw newline must fail")
 	}
-	want := "data: {\"k\":\"line\\nbreak\"}\n\ndata: [DONE]\n\n"
+	if err := w.EventJSON("message_stop", map[string]string{"type": "message_stop"}); err != nil {
+		t.Fatal(err)
+	}
+	want := "data: {\"k\":\"line\\nbreak\"}\n\ndata: [DONE]\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	if rr.Body.String() != want {
 		t.Errorf("body = %q, want %q", rr.Body.String(), want)
 	}
