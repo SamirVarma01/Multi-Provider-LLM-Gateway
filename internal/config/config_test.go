@@ -29,7 +29,7 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AuthCacheTTL != 10*time.Second || cfg.RequestTimeout != 10*time.Minute {
 		t.Errorf("durations = %v, %v", cfg.AuthCacheTTL, cfg.RequestTimeout)
 	}
-	if !cfg.MigrateOnStart || cfg.LogLevel != slog.LevelInfo || cfg.MaxBodyBytes != 4<<20 {
+	if !cfg.MigrateOnStart || cfg.LogLevel != slog.LevelInfo || cfg.MaxBodyBytes != 4<<20 || cfg.EstImageTokens != 1000 {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
 }
