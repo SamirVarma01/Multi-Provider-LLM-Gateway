@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/SamirVarma01/llm-gateway/internal/oai"
@@ -52,14 +54,15 @@ type outcome struct {
 	Provider      string
 	UpstreamModel string
 	Policy        string
+	Attempts      int // upstream attempts made, including failed ones
 	Stream        bool
 	Result        string
 	Committed     bool // the first byte of the response reached the client
 	Billable      bool // design §10: charge Usage for this request
 	Usage         provider.Usage
 	FinishReason  string
-	TTFT          time.Duration // to the first upstream chunk with output
-	Upstream      time.Duration // from the upstream call to its last byte
+	TTFT          time.Duration // the serving attempt's time to its first output chunk
+	Upstream      time.Duration // from the first upstream call to the last byte read
 	Err           error
 }
 
@@ -69,7 +72,6 @@ type call struct {
 	id      string // response id: chatcmpl-<request id>
 	created int64
 	plan    *router.Plan
-	choice  router.Choice
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -118,7 +120,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		id:      "chatcmpl-" + obs.RequestID(ctx),
 		created: s.now().Unix(),
 		plan:    plan,
-		choice:  plan.Choices[0], // one attempt until failover lands
 	}
 	var out outcome
 	if req.Stream {
@@ -130,23 +131,25 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveComplete serves a non-streaming request. The response is written only
-// after the whole upstream stream has been read, so every failure is
-// pre-commit and nothing is charged for it.
+// after an attempt's whole upstream stream has been read, so every upstream
+// failure is pre-commit: it can fail over, and nothing is charged for it.
 func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *http.Request, c *call) outcome {
-	out := outcome{Provider: c.choice.Target.Provider, UpstreamModel: c.choice.Target.UpstreamModel, Policy: c.plan.Policy}
+	out := outcome{Policy: c.plan.Policy}
 	start := s.now()
-	st, err := c.choice.Provider.Stream(provider.WithAttempt(ctx, 1), c.choice.Target, c.choice.Req)
-	if err != nil {
-		return s.failPreCommit(w, r, out, err)
-	}
-	defer st.Close()
-	resp, err := provider.Collect(st)
+	var resp provider.Response
+	a, err := s.opts.Router.Execute(ctx, c.plan, func(a *router.Attempt) error {
+		var err error
+		resp, err = provider.Collect(a.Stream)
+		return err
+	})
 	out.Upstream = s.now().Sub(start)
 	if err != nil {
 		return s.failPreCommit(w, r, out, err)
 	}
+	defer a.Abandoned() // no-op once the attempt has ended
+	out.served(a)
 
-	out.Usage = s.opts.Estimator.Resolve(c.choice.Req, resp)
+	out.Usage = s.opts.Estimator.Resolve(a.Choice.Req, resp)
 	out.FinishReason = resp.FinishReason
 	msg := oai.ResponseMessage{Role: string(provider.RoleAssistant)}
 	if resp.Content != "" || len(resp.ToolCalls) == 0 {
@@ -157,8 +160,7 @@ func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *ht
 			ID: tc.ID, Type: "function", Function: oai.FunctionCall{Name: tc.Name, Arguments: tc.Arguments},
 		})
 	}
-	w.Header().Set(headerProvider, c.choice.Target.Provider)
-	w.Header().Set(headerAttempts, "1")
+	setRouteHeaders(w, out.Provider, out.Attempts)
 	writeJSON(w, http.StatusOK, oai.ChatCompletionResponse{
 		ID:      c.id,
 		Object:  "chat.completion",
@@ -167,20 +169,44 @@ func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *ht
 		Choices: []oai.Choice{{Message: msg, FinishReason: resp.FinishReason}},
 		Usage:   wireUsage(out.Usage),
 	})
+	a.Succeeded(out.Usage.CompletionTokens)
 	out.Result, out.Committed, out.Billable = resultCompleted, true, true
 	return out
 }
 
-// failPreCommit answers a request that failed before any byte was sent.
-// Nothing is billable (design §10).
+// served fills in the attempt that committed.
+func (o *outcome) served(a *router.Attempt) {
+	o.Provider = a.Choice.Target.Provider
+	o.UpstreamModel = a.Choice.Target.UpstreamModel
+	o.Attempts = a.N
+	o.TTFT = a.TTFT()
+}
+
+func setRouteHeaders(w http.ResponseWriter, provider string, attempts int) {
+	if provider != "" {
+		w.Header().Set(headerProvider, provider)
+	}
+	w.Header().Set(headerAttempts, strconv.Itoa(attempts))
+}
+
+// failPreCommit answers a request where no attempt committed: nothing was
+// sent to the client, and nothing is billable (design §10).
 func (s *Server) failPreCommit(w http.ResponseWriter, r *http.Request, out outcome, err error) outcome {
 	out.Err = err
+	var f *router.Failure
+	if errors.As(err, &f) {
+		out.Attempts = f.Attempts
+	}
+	var ue *provider.UpstreamError
+	if errors.As(err, &ue) {
+		out.Provider = ue.Provider
+	}
 	if clientGone(r) {
 		out.Result = resultClientDisconnected
 		return out
 	}
 	out.Result = resultUpstreamError
-	s.writeUpstreamError(w, r, err)
+	s.writeUpstreamError(w, r, out, err)
 	return out
 }
 
@@ -193,6 +219,7 @@ func (s *Server) finish(ctx context.Context, out outcome) {
 		"provider", out.Provider,
 		"upstream_model", out.UpstreamModel,
 		"policy", out.Policy,
+		"attempts", out.Attempts,
 		"stream", out.Stream,
 		"result", out.Result,
 		"committed", out.Committed,
@@ -391,27 +418,33 @@ func isJSONObject(raw json.RawMessage) bool {
 	return json.Unmarshal(raw, &obj) == nil
 }
 
-// writeUpstreamError maps an upstream failure to a client response.
-func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, err error) {
+// writeUpstreamError answers a request where no attempt committed
+// (design §6.4): the client's bad request is passed through as 400,
+// timeouts are 504, every breaker open is 503, and other failures are 502.
+func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, out outcome, err error) {
 	log := obs.Logger(r.Context())
-	var ue *provider.UpstreamError
-	if !errors.As(err, &ue) {
-		log.Error("upstream call failed", "err", err)
-		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
+	setRouteHeaders(w, out.Provider, out.Attempts)
+	var f *router.Failure
+	if errors.Is(err, router.ErrNoHealthyTarget) && errors.As(err, &f) {
+		log.Warn("no healthy upstream", "retry_after", f.RetryAfter)
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(f.RetryAfter.Seconds())))))
+		oai.WriteError(w, r, http.StatusServiceUnavailable, oai.ErrTypeUpstream, "no_healthy_upstream",
+			"Every provider for this model is failing; try again later.")
 		return
 	}
-	log.Warn("upstream error", "provider", ue.Provider, "kind", ue.Kind.String(), "status", ue.Status, "msg", ue.Msg)
-	w.Header().Set(headerProvider, ue.Provider)
-	w.Header().Set(headerAttempts, "1")
-	switch ue.Kind {
-	case provider.KindBadRequest:
+	var ue *provider.UpstreamError
+	switch {
+	case errors.As(err, &ue) && ue.Kind == provider.KindBadRequest:
 		oai.WriteError(w, r, http.StatusBadRequest, oai.ErrTypeInvalidRequest, "upstream_rejected",
 			"The provider rejected the request: "+ue.Msg)
-	case provider.KindTimeout:
+	case errors.As(err, &ue) && ue.Kind == provider.KindTimeout, errors.Is(err, context.DeadlineExceeded):
 		oai.WriteError(w, r, http.StatusGatewayTimeout, oai.ErrTypeUpstream, "upstream_timeout",
 			"The provider did not respond in time.")
-	default:
+	case errors.As(err, &ue):
 		oai.WriteError(w, r, http.StatusBadGateway, oai.ErrTypeUpstream, "upstream_error",
 			"The provider failed to complete the request.")
+	default:
+		log.Error("upstream call failed", "err", err)
+		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
 	}
 }

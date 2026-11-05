@@ -37,7 +37,8 @@ func DefaultRetryConfig() RetryConfig {
 var ErrNoHealthyTarget = errors.New("router: every target's circuit breaker is open")
 
 // Failure is why Execute committed nothing. It unwraps to the last attempt's
-// error, ErrNoHealthyTarget, or the request context's error.
+// error, ErrNoHealthyTarget, or, if the request context ended, that
+// context's error joined with the last attempt's.
 type Failure struct {
 	Attempts   int           // upstream attempts made
 	RetryAfter time.Duration // with ErrNoHealthyTarget: until the first breaker admits a probe
@@ -73,7 +74,7 @@ func (r *Router) Execute(ctx context.Context, p *Plan, commit func(*Attempt) err
 	var lastErr error
 	stop := func() (*Attempt, error) {
 		if err := ctx.Err(); err != nil {
-			return nil, &Failure{Attempts: n, Err: err}
+			return nil, &Failure{Attempts: n, Err: errors.Join(err, lastErr)}
 		}
 		return nil, &Failure{Attempts: n, Err: lastErr}
 	}
