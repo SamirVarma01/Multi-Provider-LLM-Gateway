@@ -56,6 +56,7 @@ func (m *Model) MaxOutput(requested *int, c Candidate) int {
 type Options struct {
 	Breaker     BreakerConfig
 	Latency     LatencyConfig
+	Retry       RetryConfig
 	ExploreRate float64          // share of fastest-policy requests sent to a non-best target first
 	Now         func() time.Time // clock; nil = time.Now
 	Rand        func() float64   // uniform in [0, 1); nil = math/rand/v2
@@ -114,6 +115,9 @@ func New(routes config.Routes, providers map[string]provider.Provider, opts Opti
 	}
 	if opts.Latency == (LatencyConfig{}) {
 		opts.Latency = DefaultLatencyConfig()
+	}
+	if opts.Retry == (RetryConfig{}) {
+		opts.Retry = DefaultRetryConfig()
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now

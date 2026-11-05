@@ -136,7 +136,14 @@ func routerOptions(cfg config.Config, logger *slog.Logger) router.Options {
 			HalfOpenProbes:      cfg.BreakerHalfOpenProbes,
 			HalfOpenSuccesses:   cfg.BreakerHalfOpenSuccesses,
 		},
-		Latency:     router.LatencyConfig{Alpha: cfg.EWMAAlpha, StaleAfter: cfg.LatencyStaleAfter},
+		Latency: router.LatencyConfig{Alpha: cfg.EWMAAlpha, StaleAfter: cfg.LatencyStaleAfter},
+		Retry: router.RetryConfig{
+			MaxAttempts: cfg.MaxAttempts,
+			TTFTTimeout: cfg.AttemptTTFTTimeout,
+			IdleTimeout: cfg.StreamIdleTimeout,
+			BackoffBase: cfg.RetryBackoffBase,
+			BackoffMax:  cfg.RetryBackoffMax,
+		},
 		ExploreRate: cfg.RouteExploreRate,
 		Logger:      logger,
 	}
