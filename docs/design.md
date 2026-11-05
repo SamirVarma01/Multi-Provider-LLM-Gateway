@@ -1,8 +1,8 @@
 # LLM Gateway: Design
 
-Status: **draft for review (Phase 0)**. None of this is implemented yet. Defaults shown
-for config values are starting points, not measurements. All performance numbers will
-come from `scripts/` in Phase 7.
+Status: Phases 0–3 are implemented (through routing, health, and failover); sections
+for later phases describe the plan. Defaults shown for config values are starting
+points, not measurements. All performance numbers will come from `scripts/` in Phase 7.
 
 ## 1. Scope
 
@@ -101,7 +101,7 @@ All error bodies use the OpenAI shape: `{"error":{"message","type","code","reque
 
 | Method & path | Notes |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI Chat Completions request, streaming (`stream: true` → SSE) or not. Accepts `max_tokens` or `max_completion_tokens`, tools, `tool_choice`, `parallel_tool_calls`, tool messages, and image parts. Usage carries a gateway extension, `estimated: true`, when a count was estimated (§5.5). Optional `X-Route-Policy: cheapest\|fastest\|priority` overrides the alias default (Phase 3). Response headers: `X-Request-ID`, `X-Gateway-Provider`, `X-Gateway-Attempts`. |
+| `POST /v1/chat/completions` | OpenAI Chat Completions request, streaming (`stream: true` → SSE) or not. Accepts `max_tokens` or `max_completion_tokens`, tools, `tool_choice`, `parallel_tool_calls`, tool messages, and image parts. Usage carries a gateway extension, `estimated: true`, when a count was estimated (§5.5). Optional `X-Route-Policy: cheapest\|fastest\|priority` overrides the alias default; an unknown value is `400 invalid_route_policy`. Response headers: `X-Request-ID`, `X-Gateway-Provider`, `X-Gateway-Attempts`. |
 | `GET /v1/models` | Lists aliases in OpenAI list format, with an extra `pricing` object (max input/output price per 1M tokens across candidates). |
 | `GET /healthz` | Liveness: the process is up. |
 | `GET /readyz` | Readiness: Postgres and Redis are reachable. |
@@ -175,9 +175,9 @@ type UpstreamError struct {
 A caller cancellation is returned as `ctx.Err()`, never as an `UpstreamError`, so a
 client leaving is not counted against the provider's health.
 
-`Stream` creates no goroutines; reads are bounded by the request context. (The
-per-attempt TTFT and idle timeouts in §6.4 arrive in Phase 3.) Tests check for leaks
-with `goleak`.
+`Stream` creates no goroutines; reads are bounded by the request context. The router
+applies the per-attempt TTFT and idle timeouts (§6.4) with one `time.AfterFunc` timer
+per attempt, stopped when the attempt ends. Tests check for leaks with `goleak`.
 
 ### 5.2 Internal format (OpenAI-shaped)
 
@@ -324,7 +324,7 @@ providers:
     api_key_env: MOCK_A_KEY   # optional
 models:
   - alias: fast-chat
-    policy: cheapest          # default; X-Route-Policy can override per request
+    policy: cheapest          # the alias's default (priority if omitted); X-Route-Policy overrides it
     default_max_output: 1024
     candidates:
       - { provider: mock-a, model: m-small, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 1, max_output: 4096 }
@@ -336,22 +336,40 @@ are converted to integer micro-USD per 1M tokens at load time.
 
 ### 6.2 Policies
 
-Each policy orders the capable candidates. Targets with an open breaker are skipped when
-attempts are made (§6.3).
+`Router.Plan` builds each request's list of targets. It first leaves out candidates
+whose adapter cannot honor the request (`Provider.Supports`), so a request with a
+non-default `temperature` skips Anthropic targets (D10). If no candidate is left, the
+client gets `400 unsupported_request` with each target's reason, and no upstream is
+called. Each remaining target gets its own copy of the request carrying its output cap,
+`min(client limit or alias default, target max_output)`. The policy then orders the
+targets. Breakers are not consulted here; open targets are skipped when attempts are
+made (§6.4).
 
-- **`priority`**: static `priority` from config.
-- **`cheapest`**: estimated cost of *this* request, `est_in·in_price + max_out·out_price`.
-  Ties are broken by priority.
+- **`priority`**: static `priority` from config. Ties keep file order.
+- **`cheapest`**: estimated cost of *this* request, `est_in·in_price + max_out·out_price`,
+  using each target's own `max_out`. Ties are broken by priority.
 - **`fastest`**: uses per-target EWMAs (α = `EWMA_ALPHA`, default 0.2) of
   **TTFT** and **decode rate** (output tokens/s after the first token). All requests have
   both, because upstream always streams.
   - Streaming request: score = `ewma_ttft`.
   - Non-streaming request: score = `ewma_ttft + expected_out / ewma_tps`, where
-    `expected_out` = the alias-level EWMA of completion tokens, capped at `max_out`.
-  - Targets with no samples, or whose newest sample is older than `LATENCY_STALE_AFTER`
-    (default 30s), get an optimistic score equal to the best known score, so they get
-    tried. In addition, `ROUTE_EXPLORE_RATE` (default 0.05) of requests put a random
-    non-best healthy candidate first, to keep estimates fresh.
+    `expected_out` = the alias-level EWMA of completion tokens, capped at the target's
+    `max_out` (or `max_out` itself before the alias has a sample). A target with a TTFT
+    but no decode rate yet scores its TTFT alone, a lower bound, so a known slow first
+    token still counts against it.
+  - A target with no TTFT sample, or whose newest sample is older than
+    `LATENCY_STALE_AFTER` (default 30s), gets the best known score, so it competes with
+    the best target on priority. The first sample after a stale period replaces the old
+    average instead of blending with it.
+  - `ROUTE_EXPLORE_RATE` (default 0.05) of fastest-policy requests put a random non-best
+    target whose breaker is closed first. This keeps the numbers of targets that are not
+    winning fresh; it is the only way a lower-priority target with stale numbers is
+    measured while a higher-priority one is healthy.
+
+Every attempt that produced output gives a TTFT sample, including one that failed
+later. Every completed attempt gives a decode-rate sample and an alias output sample.
+Latency and breaker state are kept per target (provider + upstream model) and shared by
+every alias that routes to it (§14, D15).
 
 ### 6.3 Circuit breaker (per target)
 
@@ -364,10 +382,21 @@ stateDiagram-v2
   HalfOpen --> Open: any probe failure (cooldown doubles, capped)
 ```
 
-Defaults (config): window = last 20 outcomes or 10s, threshold 50% with at least 5
-requests, or 5 consecutive failures. Cooldown starts at 5s, doubles on each re-trip, caps
-at 60s, and resets after a full close. Half-open allows 1 concurrent probe and closes
-after 2 successes.
+Defaults (env): the window is the last `BREAKER_WINDOW_SIZE` (20) outcomes that are also
+within `BREAKER_WINDOW` (10s). The breaker trips when at least `BREAKER_FAILURE_RATE`
+(50%) of them failed and there are at least `BREAKER_MIN_REQUESTS` (5), or after
+`BREAKER_CONSECUTIVE_FAILURES` (5) failures in a row however far apart. The cooldown
+starts at `BREAKER_COOLDOWN` (5s), doubles on each re-trip from half-open, caps at
+`BREAKER_MAX_COOLDOWN` (60s), and resets after a full close. Half-open admits
+`BREAKER_HALF_OPEN_PROBES` (1) attempt at a time and closes after
+`BREAKER_HALF_OPEN_SUCCESSES` (2) probe successes. Every state change resets the
+counters and is logged.
+
+**Counting.** Each admitted attempt reports one result, when it ends: success (the
+upstream completed), failure, or nothing (see the table). A result from an attempt
+admitted before the breaker's last state change is ignored, so an attempt that started
+while closed cannot count as a probe. A half-open probe holds its slot until its attempt
+ends, which delays recovery when responses are long streams (§14, D13).
 
 | Outcome | Counts as breaker failure? | Failover allowed (pre-commit)? |
 |---|---|---|
@@ -377,7 +406,7 @@ after 2 successes.
 | Upstream 401/402/403/404 (`KindConfig`: our credentials, account, or configured model) | yes | yes |
 | Upstream 400/413/422 and other 4xx (client's request is bad) | **no** | **no**: passed through to the client as 400 |
 | Mid-stream error / idle timeout after first chunk | yes | **no** (post-commit) |
-| Client cancel | no | — |
+| Client cancel, or `REQUEST_TIMEOUT` reached | no | no: the loop stops |
 
 404 counts as configuration, not a client error: clients name a gateway alias, and the
 upstream model ID comes from the route table. An upstream 404 is therefore the gateway's
@@ -401,17 +430,33 @@ Health state lives in each gateway process (see §14, D3).
   upstream produced tokens. The provider may bill for those tokens; we do not charge the
   client for them (§12).
 
-Attempt loop:
-1. Take the next candidate from the policy order whose breaker admits a request.
-2. Attempt context = request context, plus a TTFT timeout (`ATTEMPT_TTFT_TIMEOUT`,
-   default 10s), plus an idle timeout between chunks (`STREAM_IDLE_TIMEOUT`, default 30s).
-3. On a pre-commit error that allows failover: record it in the breaker and move to the
-   next candidate **immediately**. Switching providers needs no wait. Once every
-   candidate has been tried, start again from the top after full-jitter exponential
-   backoff (base 100ms, cap 2s), up to `MAX_ATTEMPTS` (default 3) total. Stop early if
-   the remaining request deadline is shorter than the TTFT timeout.
-4. If nothing commits, return the last error mapped as follows: timeouts → 504, all
-   breakers open → 503, everything else → 502. Then release the reservation.
+Attempt loop (`Router.Execute`):
+1. Walk the plan's targets in order. A target whose breaker refuses is skipped, and
+   skipping is not an attempt.
+2. Each attempt gets its own context and one timer. The timer first runs for
+   `ATTEMPT_TTFT_TIMEOUT` (default 10s), from the upstream call to the first output
+   chunk, then restarts with `STREAM_IDLE_TIMEOUT` (default 30s) after every chunk. When
+   it fires it cancels the attempt, which surfaces as a `KindTimeout` error. The upstream
+   request carries `X-Attempt: n`.
+3. On a pre-commit error that allows failover (§6.3), record it in the breaker and move
+   to the next target **immediately**. Switching providers needs no wait. After a full
+   pass, wait a full-jitter exponential backoff (a random time up to
+   `RETRY_BACKOFF_BASE`·2^(pass−1), base 100ms, capped at `RETRY_BACKOFF_MAX` 2s) and
+   start again from the top, up to `MAX_ATTEMPTS` (default 3) attempts in total.
+4. Stop early when the error does not allow failover (the client's bad request), when
+   the request context ends (client gone or `REQUEST_TIMEOUT`), or, before any attempt
+   after the first, when less than the TTFT timeout remains before the request deadline.
+5. If nothing commits, release the reservation and answer: 400 `upstream_rejected` for
+   the client's bad request; 504 for timeouts; 503 `no_healthy_upstream` with
+   `Retry-After` (seconds until the first breaker admits a probe) when every breaker
+   refused and no attempt was made; 502 otherwise. If attempts were made and every
+   breaker then opened, the last attempt's error decides (§14, D14).
+   `X-Gateway-Attempts` counts the attempts made, on success and on failure.
+
+The TTFT timeout measures the time to the first *visible* output. Anthropic thinking
+blocks are not forwarded (§5.4) and do not count as output, so a target that thinks for
+longer than the timeout before writing text is treated as stalled. Raise
+`ATTEMPT_TTFT_TIMEOUT` for such targets.
 
 Tradeoff: while failover is running, a streaming client sees no bytes at all. The wait is
 bounded by `MAX_ATTEMPTS × ATTEMPT_TTFT_TIMEOUT` plus backoff.
@@ -755,6 +800,14 @@ Decided during Phase 2:
 | # | Decision | Reason |
 |---|---|---|
 | D9 | The Anthropic adapter calls the HTTP API directly, not through the Go SDK | The SDK's built-in retries would hide 429/5xx from failover and the breakers. The gateway also needs any base URL (the mock) and raw stream timing. Cost: we maintain the wire types ourselves; the mock enforces the 2026-10-21 rules to catch drift. |
-| D10 | Anthropic targets reject non-default `temperature`/`top_p` and unmodeled fields instead of dropping them | API version 2026-10-21 rejects sampling parameters on every model. Silently dropping a client's `temperature: 0.2` would change its output without telling it. Cost: clients that always send a non-default temperature (some SDK wrappers do) cannot use Anthropic targets until Phase 3, where `Supports` filters candidates and such requests route to OpenAI-format targets. |
+| D10 | Anthropic targets reject non-default `temperature`/`top_p` and unmodeled fields instead of dropping them | API version 2026-10-21 rejects sampling parameters on every model. Silently dropping a client's `temperature: 0.2` would change its output without telling it. Cost: such requests can only use OpenAI-format targets. Since Phase 3, `Plan` leaves Anthropic targets out for them, so they route to an OpenAI-format target when the alias has one, and get 400 when it does not. |
 | D11 | Upstream 401/402/403/404 are configuration errors that allow failover | The client never names the upstream model, so these are the gateway's credentials, account, or route table, not the client's request. |
 | D12 | The streaming commit point is the first chunk with output, not the first chunk | An upstream that sends `message_start` and then fails can still be failed over. |
+
+Decided during Phase 3:
+
+| # | Decision | Reason |
+|---|---|---|
+| D13 | A breaker counts each attempt once, when it ends; a half-open probe holds its slot until then | Counting success at the commit point and failure at a later mid-stream error would count one request twice and dilute the failure rate. Cost: recovery takes at least the cooldown plus two full responses (1 probe at a time, 2 successes). For targets that serve long streams, raise `BREAKER_HALF_OPEN_PROBES`. |
+| D14 | `503 no_healthy_upstream` only when every breaker refused before any attempt | If the request's own attempts opened the breakers, the last upstream error (502/504) says more about what happened than a 503 the gateway produced itself. |
+| D15 | Health is per target (provider + upstream model), shared by every alias that uses it | One model's 404 or overload should not block the provider's other models, and aliases that share a target share its evidence. Cost: a provider-wide outage trips each of its models' breakers separately. |
