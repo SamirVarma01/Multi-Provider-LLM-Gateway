@@ -9,16 +9,18 @@ import (
 	"github.com/SamirVarma01/llm-gateway/internal/oai"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
 	"github.com/SamirVarma01/llm-gateway/internal/provider"
+	"github.com/SamirVarma01/llm-gateway/internal/router"
 	"github.com/SamirVarma01/llm-gateway/internal/sse"
 )
 
 // serveStream serves a streaming request (design §6.4–6.5).
 //
-// Nothing is written until the first upstream chunk that carries output
-// (content, a tool call, or a finish reason). That moment is the commit
-// point: before it the request can still fail with an ordinary HTTP error
-// (and, in Phase 3, fail over); after it the response is a 200 event stream,
-// and an upstream failure ends it with an error event and no [DONE].
+// Nothing is written until an attempt produces its first chunk that carries
+// output (content, a tool call, or a finish reason). That moment is the
+// commit point: before it a failed attempt fails over to the next target,
+// and if none commits the client gets an ordinary HTTP error. After it the
+// response is a 200 event stream, there is no failover, and an upstream
+// failure ends the stream with an error event and no [DONE].
 //
 // Each upstream chunk is written and flushed as soon as it arrives. If the
 // client disconnects, the request context is cancelled, which cancels the
@@ -26,39 +28,39 @@ import (
 // disconnect has not been noticed yet.
 func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	w http.ResponseWriter, r *http.Request, c *call) outcome {
-	out := outcome{Provider: c.cand.Target.Provider, UpstreamModel: c.cand.Target.UpstreamModel, Stream: true}
+	out := outcome{Policy: c.plan.Policy, Stream: true}
 	start := s.now()
-	st, err := c.cand.Provider.Stream(provider.WithAttempt(ctx, 1), c.cand.Target, c.req)
+	var first *provider.Chunk
+	a, err := s.opts.Router.Execute(ctx, c.plan, func(a *router.Attempt) error {
+		// Hold back role-only chunks until real output arrives.
+		for {
+			ch, err := a.Stream.Recv()
+			if errors.Is(err, io.EOF) {
+				return &provider.UpstreamError{Provider: a.Choice.Target.Provider, Kind: provider.KindProtocol,
+					Retryable: true, Msg: "stream ended without output"}
+			}
+			if err != nil {
+				return err
+			}
+			if ch.HasOutput() {
+				first = ch
+				return nil
+			}
+		}
+	})
 	if err != nil {
+		out.Upstream = s.now().Sub(start)
 		return s.failPreCommit(w, r, out, err)
 	}
-	defer st.Close()
-
-	// Pre-commit: hold back role-only chunks until real output arrives.
-	var first *provider.Chunk
-	for first == nil {
-		ch, err := st.Recv()
-		if errors.Is(err, io.EOF) {
-			err = &provider.UpstreamError{Provider: out.Provider, Kind: provider.KindProtocol, Retryable: true,
-				Msg: "stream ended without output"}
-		}
-		if err != nil {
-			out.Upstream = s.now().Sub(start)
-			return s.failPreCommit(w, r, out, err)
-		}
-		if ch.HasOutput() {
-			first = ch
-		}
-	}
-	out.TTFT = s.now().Sub(start)
+	defer a.Abandoned() // no-op once the attempt has ended
+	out.served(a)
 
 	// Commit.
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("X-Accel-Buffering", "no") // ask reverse proxies not to buffer
-	h.Set(headerProvider, out.Provider)
-	h.Set(headerAttempts, "1")
+	setRouteHeaders(w, out.Provider, out.Attempts)
 	w.WriteHeader(http.StatusOK)
 	out.Committed, out.Billable = true, true
 	enc := &chunkEncoder{sw: sse.NewWriter(w), id: c.id, created: c.created, model: c.alias}
@@ -71,7 +73,7 @@ func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	}
 	var upErr error
 	for writeErr == nil {
-		ch, err := st.Recv()
+		ch, err := a.Stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -87,20 +89,23 @@ func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	}
 	out.Upstream = s.now().Sub(start)
 
-	resp := acc.Response(st.Usage())
-	out.Usage = s.opts.Estimator.Resolve(c.req, resp)
+	resp := acc.Response(a.Stream.Usage())
+	out.Usage = s.opts.Estimator.Resolve(a.Choice.Req, resp)
 	out.FinishReason = resp.FinishReason
 	switch {
 	case writeErr != nil || clientGone(r):
 		cancel() // stop the upstream now, even if the disconnect is not yet visible to ctx
+		a.Abandoned()
 		out.Result, out.Err = resultClientDisconnected, errors.Join(writeErr, upErr)
 	case upErr != nil:
+		a.Failed(upErr)
 		out.Result, out.Err = resultUpstreamError, upErr
 		obs.Logger(ctx).Warn("upstream failed mid-stream", "provider", out.Provider, "err", upErr)
 		_ = enc.streamError(r, upErr)
 	default:
+		a.Succeeded(out.Usage.CompletionTokens)
 		out.Result = resultCompleted
-		if c.req.IncludeUsage {
+		if a.Choice.Req.IncludeUsage {
 			_ = enc.usage(out.Usage)
 		}
 		_ = enc.done()

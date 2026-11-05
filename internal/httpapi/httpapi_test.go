@@ -44,18 +44,37 @@ func (s staticAuth) LookupByHash(_ context.Context, hash []byte) (auth.Key, erro
 
 type testEnv struct {
 	mock     *mock.Server
+	router   *router.Router
 	public   *httptest.Server
 	admin    *httptest.Server
 	key      string
 	outcomes chan outcome
 }
 
+// testRetry keeps failover tests fast: short stall timeouts and backoff.
+var testRetry = router.RetryConfig{
+	MaxAttempts: 3,
+	TTFTTimeout: 500 * time.Millisecond,
+	IdleTimeout: 500 * time.Millisecond,
+	BackoffBase: time.Millisecond,
+	BackoffMax:  5 * time.Millisecond,
+}
+
+// envTweak adjusts a test environment's router and server options.
+type envTweak struct {
+	router func(*router.Options)
+	server func(*Options)
+}
+
 // mockRoutes is the route table newEnv serves, with %[1]s the mock's URL.
 // "chat" (OpenAI format, default_max_output 64, max_output 1000), "tiny"
-// (max_output 5), and "claude" (Anthropic format).
+// (max_output 5), "claude" (Anthropic format), "mixed" (Anthropic
+// format first by priority, then a cheaper OpenAI-format target), and
+// "pair" (mock-a, then mock-b).
 const mockRoutes = `
 providers:
   - { name: mock-a, format: openai, base_url: "%[1]s/p/mock-a/v1" }
+  - { name: mock-b, format: openai, base_url: "%[1]s/p/mock-b/v1" }
   - { name: claude-a, format: anthropic, base_url: "%[1]s/p/claude-a/v1" }
 models:
   - alias: chat
@@ -69,21 +88,42 @@ models:
     default_max_output: 64
     candidates:
       - { provider: claude-a, model: claude-test, input_per_mtok: 3, output_per_mtok: 15, max_output: 1000 }
+  - alias: mixed
+    default_max_output: 64
+    candidates:
+      - { provider: claude-a, model: claude-test, input_per_mtok: 3, output_per_mtok: 15, priority: 1, max_output: 1000 }
+      - { provider: mock-a, model: m-small, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 2, max_output: 1000 }
+  - alias: pair
+    default_max_output: 64
+    candidates:
+      - { provider: mock-a, model: m-pair, input_per_mtok: 1, output_per_mtok: 2, priority: 1, max_output: 1000 }
+      - { provider: mock-b, model: m-pair, input_per_mtok: 1, output_per_mtok: 2, priority: 2, max_output: 1000 }
 `
 
 // newEnv starts a mock provider and a gateway in front of it (see mockRoutes).
 func newEnv(t *testing.T, b mock.Behavior, tweak func(*Options)) *testEnv {
 	t.Helper()
+	return newEnvTweaked(t, b, envTweak{server: tweak})
+}
+
+// newEnvTweaked is newEnv with router options too.
+func newEnvTweaked(t *testing.T, b mock.Behavior, tw envTweak) *testEnv {
+	t.Helper()
 	m := mock.New(mock.Options{Defaults: b, Seed: 3})
 	mockTS := httptest.NewServer(m.Handler())
 	t.Cleanup(mockTS.Close)
-	e := newEnvRoutes(t, fmt.Sprintf(mockRoutes, mockTS.URL), tweak)
+	e := newEnvRoutesTweaked(t, fmt.Sprintf(mockRoutes, mockTS.URL), tw)
 	e.mock = m
 	return e
 }
 
 // newEnvRoutes starts a gateway serving the given route table.
 func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEnv {
+	t.Helper()
+	return newEnvRoutesTweaked(t, routesYAML, envTweak{server: tweak})
+}
+
+func newEnvRoutesTweaked(t *testing.T, routesYAML string, tw envTweak) *testEnv {
 	t.Helper()
 	routes, err := config.ParseRoutes([]byte(routesYAML))
 	if err != nil {
@@ -95,7 +135,11 @@ func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEn
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := router.New(routes, providers)
+	ropts := router.Options{Retry: testRetry, Logger: obs.NewLogger(io.Discard, 0)}
+	if tw.router != nil {
+		tw.router(&ropts)
+	}
+	rt, err := router.New(routes, providers, ropts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,8 +154,8 @@ func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEn
 		RequestTimeout: 10 * time.Second,
 		MaxBodyBytes:   1 << 20,
 	}
-	if tweak != nil {
-		tweak(&opts)
+	if tw.server != nil {
+		tw.server(&opts)
 	}
 	srv := New(opts)
 	outcomes := make(chan outcome, 64)
@@ -125,7 +169,7 @@ func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEn
 	t.Cleanup(public.Close)
 	admin := httptest.NewServer(srv.AdminHandler())
 	t.Cleanup(admin.Close)
-	return &testEnv{public: public, admin: admin, key: key, outcomes: outcomes}
+	return &testEnv{router: rt, public: public, admin: admin, key: key, outcomes: outcomes}
 }
 
 // outcome waits for the next request outcome.
@@ -140,7 +184,7 @@ func (e *testEnv) outcome(t *testing.T) outcome {
 	}
 }
 
-func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.Response {
+func (e *testEnv) do(t *testing.T, method, url, bearer string, body any, headers ...http.Header) *http.Response {
 	t.Helper()
 	var rd io.Reader
 	switch b := body.(type) {
@@ -158,6 +202,11 @@ func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.R
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
+	for _, h := range headers {
+		for k, vs := range h {
+			req.Header[k] = vs
+		}
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -166,9 +215,9 @@ func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.R
 	return resp
 }
 
-func (e *testEnv) chat(t *testing.T, body any) *http.Response {
+func (e *testEnv) chat(t *testing.T, body any, headers ...http.Header) *http.Response {
 	t.Helper()
-	return e.do(t, http.MethodPost, e.public.URL+"/v1/chat/completions", e.key, body)
+	return e.do(t, http.MethodPost, e.public.URL+"/v1/chat/completions", e.key, body, headers...)
 }
 
 func chatReq(model string, maxTokens *int) oai.ChatCompletionRequest {
@@ -362,7 +411,7 @@ func TestModels(t *testing.T) {
 	e := newEnv(t, mock.Behavior{}, nil)
 	resp := e.do(t, http.MethodGet, e.public.URL+"/v1/models", e.key, nil)
 	out := decode[modelList](t, resp)
-	if out.Object != "list" || len(out.Data) != 3 {
+	if out.Object != "list" || len(out.Data) != 5 {
 		t.Fatalf("models = %+v", out)
 	}
 	m := out.Data[0]

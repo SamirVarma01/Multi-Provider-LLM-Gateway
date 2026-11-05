@@ -24,6 +24,14 @@ models:
     candidates:
       - { provider: mock-a, model: m-small, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 2, max_output: 4096 }
       - { provider: mock-b, model: m-small, input_per_mtok: 0.20, output_per_mtok: 0.80, priority: 1, max_output: 2048 }
+  - alias: chat-cheap
+    policy: cheapest
+    candidates:
+      - { provider: mock-a, model: m-small, max_output: 10 }
+  - alias: chat-fast
+    policy: fastest
+    candidates:
+      - { provider: mock-a, model: m-small, max_output: 10 }
 `
 
 func TestParseRoutes(t *testing.T) {
@@ -34,6 +42,9 @@ func TestParseRoutes(t *testing.T) {
 	m := r.Models[0]
 	if m.Policy != PolicyPriority || m.DefaultMaxOutput != DefaultMaxOutput {
 		t.Errorf("defaults not applied: %+v", m)
+	}
+	if r.Models[1].Policy != PolicyCheapest || r.Models[2].Policy != PolicyFastest {
+		t.Errorf("policies = %q, %q", r.Models[1].Policy, r.Models[2].Policy)
 	}
 	if len(m.Candidates) != 2 || m.Candidates[1].Provider != "mock-b" || r.Providers[1].APIKeyEnv != "MOCK_B_KEY" ||
 		r.Providers[1].MaxTokensField != MaxCompletionTokensField || r.Providers[2].Format != FormatAnthropic {
@@ -58,7 +69,7 @@ providers:
   - { name: q, format: anthropic, base_url: "http://x/v1", max_tokens_field: max_tokens }
 models:
   - alias: a
-    policy: fastest
+    policy: quickest
     candidates:
       - { provider: nope, model: "", input_per_mtok: -1, max_output: 0 }
   - alias: a
@@ -67,7 +78,7 @@ models:
 			want: []string{
 				`unsupported format "gemini"`, "base_url", `duplicate name "p"`,
 				"max_tokens_field must be", "applies only to the openai format",
-				`unsupported policy "fastest"`, `unknown provider "nope"`, "model is required",
+				`unsupported policy "quickest"`, `unknown provider "nope"`, "model is required",
 				"prices must be", "max_output must be positive", `duplicate alias "a"`,
 				"at least one candidate",
 			},
