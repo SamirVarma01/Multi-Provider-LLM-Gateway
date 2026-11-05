@@ -23,10 +23,18 @@ const (
 	MaxCompletionTokensField = "max_completion_tokens"
 )
 
-// Routing policies. Phase 1 implements only priority order.
+// Routing policies (design §6.2). An alias's policy is its default; clients
+// can override it per request with X-Route-Policy.
 const (
-	PolicyPriority = "priority"
+	PolicyPriority = "priority" // static priority from the route table
+	PolicyCheapest = "cheapest" // lowest estimated cost of the request
+	PolicyFastest  = "fastest"  // lowest expected latency from live measurements
 )
+
+// ValidPolicy reports whether p names a routing policy.
+func ValidPolicy(p string) bool {
+	return p == PolicyPriority || p == PolicyCheapest || p == PolicyFastest
+}
 
 // DefaultMaxOutput is used when a model sets no default_max_output.
 const DefaultMaxOutput = 1024
@@ -144,7 +152,7 @@ func (r Routes) Validate() error {
 			add("models[%d]: duplicate alias %q", i, m.Alias)
 		}
 		aliases[m.Alias] = true
-		if m.Policy != PolicyPriority {
+		if !ValidPolicy(m.Policy) {
 			add("model %q: unsupported policy %q", m.Alias, m.Policy)
 		}
 		if m.DefaultMaxOutput < 0 {

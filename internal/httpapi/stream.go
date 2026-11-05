@@ -26,9 +26,10 @@ import (
 // disconnect has not been noticed yet.
 func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	w http.ResponseWriter, r *http.Request, c *call) outcome {
-	out := outcome{Provider: c.cand.Target.Provider, UpstreamModel: c.cand.Target.UpstreamModel, Stream: true}
+	out := outcome{Provider: c.choice.Target.Provider, UpstreamModel: c.choice.Target.UpstreamModel,
+		Policy: c.plan.Policy, Stream: true}
 	start := s.now()
-	st, err := c.cand.Provider.Stream(provider.WithAttempt(ctx, 1), c.cand.Target, c.req)
+	st, err := c.choice.Provider.Stream(provider.WithAttempt(ctx, 1), c.choice.Target, c.choice.Req)
 	if err != nil {
 		return s.failPreCommit(w, r, out, err)
 	}
@@ -88,7 +89,7 @@ func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	out.Upstream = s.now().Sub(start)
 
 	resp := acc.Response(st.Usage())
-	out.Usage = s.opts.Estimator.Resolve(c.req, resp)
+	out.Usage = s.opts.Estimator.Resolve(c.choice.Req, resp)
 	out.FinishReason = resp.FinishReason
 	switch {
 	case writeErr != nil || clientGone(r):
@@ -100,7 +101,7 @@ func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 		_ = enc.streamError(r, upErr)
 	default:
 		out.Result = resultCompleted
-		if c.req.IncludeUsage {
+		if c.choice.Req.IncludeUsage {
 			_ = enc.usage(out.Usage)
 		}
 		_ = enc.done()

@@ -15,10 +15,12 @@ import (
 	"github.com/SamirVarma01/llm-gateway/internal/router"
 )
 
-// Response headers describing how the gateway served a request.
+// Headers. X-Route-Policy is a request header that overrides the alias's
+// routing policy; the others describe how the gateway served a request.
 const (
-	headerProvider = "X-Gateway-Provider"
-	headerAttempts = "X-Gateway-Attempts"
+	headerRoutePolicy = "X-Route-Policy"
+	headerProvider    = "X-Gateway-Provider"
+	headerAttempts    = "X-Gateway-Attempts"
 )
 
 // apiError is a client-facing error.
@@ -49,6 +51,7 @@ const (
 type outcome struct {
 	Provider      string
 	UpstreamModel string
+	Policy        string
 	Stream        bool
 	Result        string
 	Committed     bool // the first byte of the response reached the client
@@ -65,8 +68,8 @@ type call struct {
 	alias   string
 	id      string // response id: chatcmpl-<request id>
 	created int64
-	cand    router.Candidate
-	req     *provider.ChatRequest
+	plan    *router.Plan
+	choice  router.Choice
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -90,12 +93,23 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("The model %q does not exist.", body.Model)}).write(w, r)
 		return
 	}
-	// Phase 2: the first candidate in priority order, one attempt.
-	cand := model.Candidates[0]
-	maxOut := model.MaxOutput(body.OutputLimit(), cand)
-	req.MaxTokens = &maxOut
-	if err := cand.Provider.Supports(req); err != nil {
+	plan, err := s.opts.Router.Plan(model, router.Request{
+		Chat:      req,
+		MaxTokens: body.OutputLimit(),
+		Policy:    r.Header.Get(headerRoutePolicy),
+		EstInput:  s.opts.Estimator.Input(req),
+	})
+	var unsupported *router.UnsupportedError
+	switch {
+	case errors.Is(err, router.ErrUnknownPolicy):
+		badRequest("invalid_route_policy", "%s must be priority, cheapest, or fastest.", headerRoutePolicy).write(w, r)
+		return
+	case errors.As(err, &unsupported):
 		badRequest("unsupported_request", "%v", err).write(w, r)
+		return
+	case err != nil:
+		obs.Logger(ctx).Error("routing failed", "err", err)
+		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
 		return
 	}
 
@@ -103,8 +117,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		alias:   body.Model,
 		id:      "chatcmpl-" + obs.RequestID(ctx),
 		created: s.now().Unix(),
-		cand:    cand,
-		req:     req,
+		plan:    plan,
+		choice:  plan.Choices[0], // one attempt until failover lands
 	}
 	var out outcome
 	if req.Stream {
@@ -119,9 +133,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 // after the whole upstream stream has been read, so every failure is
 // pre-commit and nothing is charged for it.
 func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *http.Request, c *call) outcome {
-	out := outcome{Provider: c.cand.Target.Provider, UpstreamModel: c.cand.Target.UpstreamModel}
+	out := outcome{Provider: c.choice.Target.Provider, UpstreamModel: c.choice.Target.UpstreamModel, Policy: c.plan.Policy}
 	start := s.now()
-	st, err := c.cand.Provider.Stream(provider.WithAttempt(ctx, 1), c.cand.Target, c.req)
+	st, err := c.choice.Provider.Stream(provider.WithAttempt(ctx, 1), c.choice.Target, c.choice.Req)
 	if err != nil {
 		return s.failPreCommit(w, r, out, err)
 	}
@@ -132,7 +146,7 @@ func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *ht
 		return s.failPreCommit(w, r, out, err)
 	}
 
-	out.Usage = s.opts.Estimator.Resolve(c.req, resp)
+	out.Usage = s.opts.Estimator.Resolve(c.choice.Req, resp)
 	out.FinishReason = resp.FinishReason
 	msg := oai.ResponseMessage{Role: string(provider.RoleAssistant)}
 	if resp.Content != "" || len(resp.ToolCalls) == 0 {
@@ -143,7 +157,7 @@ func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *ht
 			ID: tc.ID, Type: "function", Function: oai.FunctionCall{Name: tc.Name, Arguments: tc.Arguments},
 		})
 	}
-	w.Header().Set(headerProvider, c.cand.Target.Provider)
+	w.Header().Set(headerProvider, c.choice.Target.Provider)
 	w.Header().Set(headerAttempts, "1")
 	writeJSON(w, http.StatusOK, oai.ChatCompletionResponse{
 		ID:      c.id,
@@ -178,6 +192,7 @@ func (s *Server) finish(ctx context.Context, out outcome) {
 	attrs := []any{
 		"provider", out.Provider,
 		"upstream_model", out.UpstreamModel,
+		"policy", out.Policy,
 		"stream", out.Stream,
 		"result", out.Result,
 		"committed", out.Committed,

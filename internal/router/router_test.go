@@ -43,7 +43,7 @@ func build(t *testing.T, env map[string]string) (*Router, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(routes, providers)
+	return New(routes, providers, Options{})
 }
 
 func TestResolve(t *testing.T) {

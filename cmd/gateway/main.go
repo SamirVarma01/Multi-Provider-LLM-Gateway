@@ -54,7 +54,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	rt, err := router.New(routes, providers)
+	rt, err := router.New(routes, providers, routerOptions(cfg, logger))
 	if err != nil {
 		return err
 	}
@@ -121,6 +121,25 @@ func run() error {
 	err = g.Wait()
 	logger.Info("stopped")
 	return err
+}
+
+func routerOptions(cfg config.Config, logger *slog.Logger) router.Options {
+	return router.Options{
+		Breaker: router.BreakerConfig{
+			WindowSize:          cfg.BreakerWindowSize,
+			Window:              cfg.BreakerWindow,
+			FailureRate:         cfg.BreakerFailureRate,
+			MinRequests:         cfg.BreakerMinRequests,
+			ConsecutiveFailures: cfg.BreakerConsecutiveFailures,
+			Cooldown:            cfg.BreakerCooldown,
+			MaxCooldown:         cfg.BreakerMaxCooldown,
+			HalfOpenProbes:      cfg.BreakerHalfOpenProbes,
+			HalfOpenSuccesses:   cfg.BreakerHalfOpenSuccesses,
+		},
+		Latency:     router.LatencyConfig{Alpha: cfg.EWMAAlpha, StaleAfter: cfg.LatencyStaleAfter},
+		ExploreRate: cfg.RouteExploreRate,
+		Logger:      logger,
+	}
 }
 
 func newServer(addr string, h http.Handler) *http.Server {

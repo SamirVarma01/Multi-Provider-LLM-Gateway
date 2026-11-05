@@ -52,7 +52,8 @@ type testEnv struct {
 
 // mockRoutes is the route table newEnv serves, with %[1]s the mock's URL.
 // "chat" (OpenAI format, default_max_output 64, max_output 1000), "tiny"
-// (max_output 5), and "claude" (Anthropic format).
+// (max_output 5), "claude" (Anthropic format), and "mixed" (Anthropic
+// format first by priority, then a cheaper OpenAI-format target).
 const mockRoutes = `
 providers:
   - { name: mock-a, format: openai, base_url: "%[1]s/p/mock-a/v1" }
@@ -69,6 +70,11 @@ models:
     default_max_output: 64
     candidates:
       - { provider: claude-a, model: claude-test, input_per_mtok: 3, output_per_mtok: 15, max_output: 1000 }
+  - alias: mixed
+    default_max_output: 64
+    candidates:
+      - { provider: claude-a, model: claude-test, input_per_mtok: 3, output_per_mtok: 15, priority: 1, max_output: 1000 }
+      - { provider: mock-a, model: m-small, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 2, max_output: 1000 }
 `
 
 // newEnv starts a mock provider and a gateway in front of it (see mockRoutes).
@@ -95,7 +101,7 @@ func newEnvRoutes(t *testing.T, routesYAML string, tweak func(*Options)) *testEn
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt, err := router.New(routes, providers)
+	rt, err := router.New(routes, providers, router.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +146,7 @@ func (e *testEnv) outcome(t *testing.T) outcome {
 	}
 }
 
-func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.Response {
+func (e *testEnv) do(t *testing.T, method, url, bearer string, body any, headers ...http.Header) *http.Response {
 	t.Helper()
 	var rd io.Reader
 	switch b := body.(type) {
@@ -158,6 +164,11 @@ func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.R
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
+	for _, h := range headers {
+		for k, vs := range h {
+			req.Header[k] = vs
+		}
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -166,9 +177,9 @@ func (e *testEnv) do(t *testing.T, method, url, bearer string, body any) *http.R
 	return resp
 }
 
-func (e *testEnv) chat(t *testing.T, body any) *http.Response {
+func (e *testEnv) chat(t *testing.T, body any, headers ...http.Header) *http.Response {
 	t.Helper()
-	return e.do(t, http.MethodPost, e.public.URL+"/v1/chat/completions", e.key, body)
+	return e.do(t, http.MethodPost, e.public.URL+"/v1/chat/completions", e.key, body, headers...)
 }
 
 func chatReq(model string, maxTokens *int) oai.ChatCompletionRequest {
@@ -362,7 +373,7 @@ func TestModels(t *testing.T) {
 	e := newEnv(t, mock.Behavior{}, nil)
 	resp := e.do(t, http.MethodGet, e.public.URL+"/v1/models", e.key, nil)
 	out := decode[modelList](t, resp)
-	if out.Object != "list" || len(out.Data) != 3 {
+	if out.Object != "list" || len(out.Data) != 4 {
 		t.Fatalf("models = %+v", out)
 	}
 	m := out.Data[0]
