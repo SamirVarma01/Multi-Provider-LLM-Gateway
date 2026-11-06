@@ -2,12 +2,12 @@
 //
 // Postgres comes from TEST_DATABASE_URL if set: a server URL with no database
 // name or query, e.g. postgres://postgres:test@localhost:5432, for a user that
-// may CREATE DATABASE. Otherwise a container is started with the
-// docker CLI on first use and removed by Main. Running containers through the
-// CLI instead of a Docker SDK keeps the test process free of background
-// goroutines, so goleak checks stay meaningful.
+// may CREATE DATABASE. Redis comes from TEST_REDIS_URL if set. Otherwise a
+// container is started with the docker CLI on first use and removed by Main.
+// Running containers through the CLI instead of a Docker SDK keeps the test
+// process free of background goroutines, so goleak checks stay meaningful.
 //
-// When neither is available, tests that need Postgres are skipped, unless
+// When neither is available, tests that need the service are skipped, unless
 // REQUIRE_INTEGRATION=1, in which case they fail.
 package testutil
 
@@ -45,8 +45,10 @@ var pg struct {
 // then fails the run if goroutines leaked. Use it as the body of TestMain.
 func Main(m *testing.M) {
 	code := m.Run()
-	if pg.containerID != "" {
-		_ = exec.Command("docker", "rm", "-f", pg.containerID).Run()
+	for _, id := range []string{pg.containerID, rd.containerID} {
+		if id != "" {
+			_ = exec.Command("docker", "rm", "-f", id).Run()
+		}
 	}
 	if code == 0 {
 		if err := goleak.Find(); err != nil {

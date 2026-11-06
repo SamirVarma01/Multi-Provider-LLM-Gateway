@@ -32,8 +32,8 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.MigrateOnStart || cfg.LogLevel != slog.LevelInfo || cfg.MaxBodyBytes != 4<<20 || cfg.EstImageTokens != 1000 {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
-	if cfg.EstSafetyFactor != 1.25 {
-		t.Errorf("EstSafetyFactor = %v", cfg.EstSafetyFactor)
+	if cfg.EstSafetyFactor != 1.25 || cfg.RateLimitTimeout != 250*time.Millisecond || cfg.LedgerTimeout != 5*time.Second {
+		t.Errorf("accounting defaults: %+v", cfg)
 	}
 	// Routing defaults from design §6.
 	if cfg.MaxAttempts != 3 || cfg.AttemptTTFTTimeout != 10*time.Second || cfg.StreamIdleTimeout != 30*time.Second ||
