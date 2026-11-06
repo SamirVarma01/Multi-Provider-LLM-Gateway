@@ -1,7 +1,7 @@
 # LLM Gateway: Design
 
-Status: Phases 0–3 are implemented (through routing, health, and failover); sections
-for later phases describe the plan. Defaults shown for config values are starting
+Status: Phases 0–4 are implemented (through rate limits and budgets); sections for
+later phases describe the plan. Defaults shown for config values are starting
 points, not measurements. All performance numbers will come from `scripts/` in Phase 7.
 
 ## 1. Scope
@@ -64,8 +64,8 @@ sequenceDiagram
   G-->>C: chunks… (stream) / single JSON (non-stream)
   G->>G: capture usage (reported or estimated)
   G-->>C: final bytes flushed
+  G->>RL: Lua: adjust token bucket by (estimate − actual)
   G->>PG: settle(actual) + release(remainder)
-  G->>RL: Lua: adjust token bucket by (actual − estimate)
 ```
 
 | # | Step | Failure → client sees | Ledger effect |
@@ -80,12 +80,12 @@ sequenceDiagram
 | 8 | Attempt loop with failover, allowed **only before the commit point** (§6.4) | 502/503/504 if every attempt fails | `release(R)` |
 | 9 | Stream to client, or aggregate for non-stream | after commit: SSE error event (§6.5) | — |
 | 10 | Capture usage from the provider's stream, or estimate it and set `estimated=true` | — | — |
-| 11 | Flush the final bytes to the client, **then** settle using a detached context | not visible to client; retried with backoff until the request deadline, then left to the reconciler | `settle(A)` + `release(max(R−A,0))` |
-| 12 | Adjust the TPM bucket by `actual_tokens − admitted_tokens` | — | — |
+| 11 | Hand the final bytes to the client, **then** close the request in a background task with a detached context: adjust the TPM bucket by `admitted_tokens − actual_tokens`, then settle | not visible to client; retried with backoff until the request deadline, then left to the reconciler | `settle(A)` + `release(max(R−A,0))` |
 
-Settling *after* the last byte keeps the Postgres round trip off the client's critical
-path. If the gateway crashes between the flush and the settle, the reservation stays
-open and the reconciler resolves it (§9).
+Closing runs after the handler returns, not in it, which keeps Postgres off the client's
+critical path entirely (§14, D16). `Server.Drain` waits for these tasks at shutdown. If
+the gateway crashes before the close, the reservation stays open and the reconciler
+resolves it (§9).
 
 **Always stream upstream.** The gateway asks the provider for a stream even when the
 client asked for a non-streaming response, and builds the JSON body itself. That leaves
@@ -310,7 +310,7 @@ the provider. It is listed as a non-guarantee.
   instead of the URL or base64 length. Input is estimated from the request; output from
   the content and tool arguments the gateway actually received.
 - Clients see the flag as a gateway extension, `usage.estimated: true` (omitted when
-  false). The ledger will persist it (Phase 4).
+  false). The ledger records it as `usage_estimated` on the settle entry.
 
 ## 6. Routing, health, and failover
 
@@ -477,32 +477,37 @@ No failover. On an upstream error or idle timeout mid-stream, the gateway:
 Each key has two token buckets in Redis: `rl:{<key_id>}:rpm` and `rl:{<key_id>}:tpm`. The
 hash tag keeps both in the same Redis Cluster slot. Each bucket is a hash
 `{tokens, ts_ms}`. Capacity = the per-minute limit, refill = limit/60 per second. A
-`null` limit means that bucket is skipped.
+`null` limit means that bucket is skipped, and a key with neither makes no Redis call.
 
 **Admission:** one Lua script, atomic across both buckets:
 
 ```lua
--- KEYS: rpm, tpm   ARGV: rpm_limit, tpm_limit, tok_cost
+-- KEYS: rpm, tpm   ARGV: rpm_limit, tpm_limit, tok_cost   (limit 0 = skip that bucket)
 local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)       -- server clock, not the gateway's
--- refill both: tokens = min(cap, tokens + (now - ts) * rate)
--- if rpm >= 1 and tpm >= tok_cost: deduct both, PEXPIRE 120000, return {1, 0}
+-- refill both: tokens = min(cap, tokens + (now - ts) * rate); a missing bucket is full
+-- if rpm >= 1 and tpm >= tok_cost: deduct both, return {1, 0}
 -- else: return {0, wait_ms}  where wait_ms = max(time for rpm to reach 1, time for tpm to reach tok_cost)
 -- neither bucket is deducted on reject
 ```
 
-- `tok_cost = est_in + max_out`, so a request is admitted against its worst case.
-- **Adjust** (a second small script, after settle): add `admitted − actual` back to the
-  TPM bucket, capped at capacity. If actual > admitted the bucket can go negative. That
-  debt delays later requests, so TPM holds on average.
-- If the request is rejected later with 402, its tokens are refunded but it still counts
-  as a request.
-- 429 sets `Retry-After = ceil(wait_ms / 1000)`, minimum 1. If `tok_cost > tpm_limit`
-  the request can never be admitted, so it gets 429 `tokens_exceed_limit` with no
-  `Retry-After`.
-- **Redis unavailable → fail open**, with the `ratelimit_errors_total` metric and a
-  warning log. Budgets are in Postgres, so money stays protected; only rate fairness is
-  lost while Redis is down.
+- `tok_cost = est_in + max_out`, with the largest `max_out` among the request's targets,
+  so a request is admitted against its worst case.
+- **TTL:** a bucket's TTL is the time it takes to refill, so expiry only ever removes a
+  full bucket and token debt is never forgiven early.
+- **Adjust** (a second small script, when the request closes): add `admitted − actual`
+  back to the TPM bucket, capped at capacity. If actual > admitted the bucket can go
+  negative. That debt delays later requests, so TPM holds on average. A request that
+  failed used nothing, so all its tokens come back.
+- If the request is rejected later with 402, or Postgres is down, its tokens are refunded
+  but it still counts as a request.
+- 429 `rate_limit_exceeded` sets `Retry-After = ceil(wait_ms / 1000)`, minimum 1. If
+  `tok_cost > tpm_limit` the request can never be admitted, so it gets 429
+  `tokens_exceed_limit` with no `Retry-After`, without calling Redis.
+- **Redis unavailable → fail open**, with a warning log (and the `ratelimit_errors_total`
+  metric in Phase 6). Budgets are in Postgres, so money stays protected; only rate
+  fairness is lost while Redis is down. `RATELIMIT_TIMEOUT` (default 250ms) bounds what
+  an unresponsive Redis adds to a request.
 
 ## 8. Budgets and the ledger
 
@@ -517,6 +522,8 @@ cost_nusd(in, out, price) = ceil((in · price.in_micro_per_m + out · price.out_
 
 This is integer math with rounding of at most 1 nano-USD per request. The gateway,
 reconciler, and `reconcile_check` all use this one function, so comparisons are exact.
+It runs in 128 bits and saturates at 1e18 nano-USD (1e9 USD, the largest budget), because
+token counts come from upstreams and a bad one must not overflow an account's totals.
 
 ### 8.2 Schema
 
@@ -556,7 +563,7 @@ CREATE TABLE ledger_entries (
   completion_tokens integer,                  -- settle
   usage_estimated   boolean,                  -- settle
   source            text NOT NULL,            -- 'gateway' | 'reconciler'
-  reason            text,                     -- release: completed | failed | rejected | orphan_no_call | orphan_unknown_usage
+  reason            text,                     -- release: completed | interrupted | failed | rejected | cancelled | orphan_no_call | orphan_unknown_usage
   meta              jsonb,                    -- reserve: candidate targets + price snapshot
   created_at        timestamptz NOT NULL DEFAULT now(),
   UNIQUE (request_id, kind)                   -- the idempotency key
@@ -568,13 +575,15 @@ CREATE INDEX ON ledger_entries (created_at) WHERE kind = 'reserve';
 
 ### 8.3 Estimating the reservation
 
-- `est_in = ceil(chars(messages, tools) / 4 · EST_SAFETY_FACTOR)` (default 1.25). Each
-  image part counts as `EST_IMAGE_TOKENS` instead of its base64 length. The
-  `TokenEstimator` interface lets a real tokenizer replace this later.
+- `est_in = ceil(estimate(messages, tools) · EST_SAFETY_FACTOR)` (default 1.25), using
+  the heuristic in §5.5, where each image part counts as `EST_IMAGE_TOKENS` instead of its
+  base64 length. The margin applies only here: usage estimates (§5.5) are not inflated by
+  it, because it exists to avoid under-reserving, not to raise what is charged.
 - `max_out = min(client max_tokens or alias default_max_output, target max_output)`.
-- `R = max over candidates of cost_nusd(est_in, max_out, price)`. Reserving the maximum
-  means failover to a more expensive candidate never needs a second reservation. The cost
-  is holding more budget than needed while the request runs.
+- `R = max over the request's targets of cost_nusd(est_in, max_out, price)`. Reserving
+  the maximum means failover to a more expensive target never needs a second reservation.
+  The cost is holding more budget than needed while the request runs. Targets `Plan` left
+  out (§6.2) do not count.
 
 ### 8.4 Reserve → settle → release
 
@@ -602,27 +611,36 @@ therefore serialize per key, and the sum of reservations can never pass the budg
 The cost: requests for the same key queue on one row lock for the length of a short
 transaction. Throughput for a single hot key is limited by that, and Phase 7 measures it.
 
-**Settle** (gateway or reconciler, one transaction):
+**Settle** (gateway or reconciler) is also one statement, using data-modifying CTEs:
 
 ```sql
-BEGIN;
--- 1. Close token. Every closing path inserts a release; UNIQUE(request_id, kind) lets only one win.
-INSERT INTO ledger_entries (request_id, key_id, kind, amount_nusd, reason, source)
-SELECT request_id, key_id, 'release', GREATEST(amount_nusd - $A, 0), 'completed', $src
-  FROM ledger_entries WHERE request_id = $req AND kind = 'reserve'
-ON CONFLICT (request_id, kind) DO NOTHING
-RETURNING key_id, amount_nusd;                 -- 0 rows → already closed → ROLLBACK, return no-op
--- 2. The charge.
-INSERT INTO ledger_entries (request_id, key_id, kind, amount_nusd, provider, upstream_model,
-                            prompt_tokens, completion_tokens, usage_estimated, source)
-VALUES (...);
--- 3. Materialized totals (R read from the reserve row, never trusted from memory).
-UPDATE key_accounts SET held_nusd = held_nusd - $R, spent_nusd = spent_nusd + $A WHERE key_id = $key;
-COMMIT;
+WITH r AS (
+  SELECT key_id, amount_nusd, alias FROM ledger_entries WHERE request_id = $req AND kind = 'reserve'
+), closed AS (
+  -- Close token. Every closing path inserts a release; UNIQUE(request_id, kind) lets only one win.
+  INSERT INTO ledger_entries (request_id, key_id, kind, amount_nusd, alias, reason, source)
+  SELECT $req, key_id, 'release', GREATEST(amount_nusd - $A, 0), alias, $reason, $src FROM r
+  ON CONFLICT (request_id, kind) DO NOTHING
+  RETURNING key_id                             -- no row: already closed, nothing below writes
+), charged AS (
+  INSERT INTO ledger_entries (request_id, key_id, kind, amount_nusd, alias, provider, upstream_model,
+                              prompt_tokens, completion_tokens, usage_estimated, source)
+  SELECT $req, r.key_id, 'settle', $A, r.alias, ... FROM r JOIN closed USING (key_id)
+)
+-- Materialized totals (R read from the reserve row, never trusted from memory).
+UPDATE key_accounts a
+   SET held_nusd = a.held_nusd - r.amount_nusd, spent_nusd = a.spent_nusd + $A, updated_at = now()
+  FROM r JOIN closed USING (key_id)
+ WHERE a.key_id = r.key_id;
 ```
 
 **Release-only** (call failed, rejected, or never happened): the same close token with
 amount `R`, and `held -= R`. No `settle` row.
+
+**Reasons** on the release entry: `completed` and `interrupted` (settled, the latter for
+partial output); `failed`, `rejected` (the upstream refused the client's request), and
+`cancelled` (the client left before the commit point) are released with no charge. The
+reconciler adds `orphan_no_call` and `orphan_unknown_usage`.
 
 Properties:
 - **Exactly one close per request.** Every closing path inserts `release`, and
@@ -745,6 +763,9 @@ added in Phase 2 for adapter tests).
 - Attempts abandoned during failover may be billed by the provider but are not charged to
   the client. That cost falls on the gateway operator.
 - Spend can exceed the budget by the estimation error of in-flight requests.
+- A client close to its budget can get a 402 for a request that would have fit: the
+  previous request's whole reservation is held until its background close finishes, which
+  may be just after the client has its response.
 - Rate limits are not enforced while Redis is down.
 - Revocation takes effect within `AUTH_CACHE_TTL`, not immediately.
 - Anthropic cache tokens are priced as normal input tokens.
@@ -811,3 +832,11 @@ Decided during Phase 3:
 | D13 | A breaker counts each attempt once, when it ends; a half-open probe holds its slot until then | Counting success at the commit point and failure at a later mid-stream error would count one request twice and dilute the failure rate. Cost: recovery takes at least the cooldown plus two full responses (1 probe at a time, 2 successes). For targets that serve long streams, raise `BREAKER_HALF_OPEN_PROBES`. |
 | D14 | `503 no_healthy_upstream` only when every breaker refused before any attempt | If the request's own attempts opened the breakers, the last upstream error (502/504) says more about what happened than a 503 the gateway produced itself. |
 | D15 | Health is per target (provider + upstream model), shared by every alias that uses it | One model's 404 or overload should not block the provider's other models, and aliases that share a target share its evidence. Cost: a provider-wide outage trips each of its models' breakers separately. |
+
+Decided during Phase 4:
+
+| # | Decision | Reason |
+|---|---|---|
+| D16 | Requests are closed in a tracked background task, not in the handler | A running handler holds the response open: a stream's terminating chunk, and the next request on a keep-alive connection, would wait for Postgres for as long as settlement retried. Refines D7. Cost: a task to drain at shutdown, and one possible spurious 402 near the budget (§12). |
+| D17 | Reserve, settle, and release are each one SQL statement | Atomic with one round trip, where §8.4 first described a three-statement transaction. Behaviour is unchanged. |
+| D18 | Idempotent settle and its retries were built in Phase 4, not Phase 5 | Budgets cannot work without closing requests, and a non-idempotent close would only have been replaced. Phase 5 keeps the reconciler, usage reads, and `reconcile_check`. |
