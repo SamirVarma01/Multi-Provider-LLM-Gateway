@@ -1,6 +1,6 @@
 # LLM Gateway: Design
 
-Status: Phases 0–4 are implemented (through rate limits and budgets); sections for
+Status: Phases 0–5 are implemented (through the ledger and reconciler); sections for
 later phases describe the plan. Defaults shown for config values are starting
 points, not measurements. All performance numbers will come from `scripts/` in Phase 7.
 
@@ -115,9 +115,9 @@ All error bodies use the OpenAI shape: `{"error":{"message","type","code","reque
 | `GET /admin/keys` | List: id, name, prefix, limits, budget, created/revoked. No secrets. |
 | `PATCH /admin/keys/{id}` | `{rpm_limit?, tpm_limit?, budget_usd?}`. `null` means unlimited. |
 | `POST /admin/keys/{id}/revoke` | Sets `revoked_at`. Takes effect within `AUTH_CACHE_TTL`. |
-| `GET /admin/keys/{id}/usage?from&to` | Spent, held, available, request count, and tokens grouped by alias and provider, all derived from the ledger. |
-| `GET /admin/keys/{id}/ledger?limit&before` | Raw ledger entries (paginated). |
-| `POST /admin/reconcile` | Runs one reconciler pass now and returns what it resolved (used by scripts). |
+| `GET /admin/keys/{id}/usage?from&to` | Derived from the ledger entries, not `key_accounts`. Budget, total spent, held, and available are current; spent, request count, and tokens by alias, provider, and model cover the window (RFC 3339; `from` inclusive, `to` exclusive). Amounts come in USD and in nano-USD. |
+| `GET /admin/keys/{id}/ledger?limit&before` | Raw ledger entries, newest first. `limit` defaults to 100, at most 1000. Pass the response's `next_before` as `before` for the next page. |
+| `POST /admin/reconcile` | Runs one reconciler pass now and returns what it resolved (used by scripts). 409 if a pass is already running. |
 
 The admin API is on a separate listener so that it is not exposed when only `:8080`
 is published.
@@ -322,6 +322,7 @@ providers:
     format: openai            # adapter
     base_url: http://mock:9000/p/mock-a/v1   # up to and including /v1
     api_key_env: MOCK_A_KEY   # optional
+    usage_url: http://mock:9000   # optional: per-request usage lookup, mock only (§9)
 models:
   - alias: fast-chat
     policy: cheapest          # the alias's default (priority if omitted); X-Route-Policy overrides it
@@ -570,7 +571,7 @@ CREATE TABLE ledger_entries (
 );
 CREATE INDEX ON ledger_entries (key_id, created_at);
 CREATE INDEX ON ledger_entries (created_at) WHERE kind = 'reserve';
--- Append-only: a trigger raises on UPDATE/DELETE, and the app role has no UPDATE/DELETE grant.
+-- Append-only: triggers raise on UPDATE, DELETE, and TRUNCATE (§14, D21).
 ```
 
 ### 8.3 Estimating the reservation
@@ -656,30 +657,55 @@ Properties:
 
 ## 9. Reconciler
 
-The reconciler runs as an in-process loop (`RECONCILE_INTERVAL`, default 30s). It is
-guarded by `pg_try_advisory_lock`, so only one gateway instance runs it at a time. It is
-also available as a one-shot CLI and as `POST /admin/reconcile`.
+The reconciler runs as an in-process loop (`RECONCILE_INTERVAL`, default 30s; 0 runs it
+only on demand). It is guarded by `pg_try_advisory_lock`, so only one runs at a time
+across gateway instances. It is also available as `POST /admin/reconcile` and as a
+one-shot CLI for when the gateway is down (`make reconcile`).
 
 ```sql
-SELECT r.request_id, r.key_id, r.amount_nusd, r.meta FROM ledger_entries r
+SELECT r.id, r.created_at, r.request_id, r.meta FROM ledger_entries r
  WHERE r.kind = 'reserve' AND r.created_at < now() - $T
+   AND (r.created_at, r.id) > ($last_at, $last_id)
    AND NOT EXISTS (SELECT 1 FROM ledger_entries x WHERE x.request_id = r.request_id AND x.kind = 'release')
- ORDER BY r.created_at LIMIT 100;
+ ORDER BY r.created_at, r.id LIMIT 100;
 ```
 
-`T = REQUEST_TIMEOUT + RECONCILE_GRACE`. The gateway enforces `REQUEST_TIMEOUT` as a
-hard deadline on every request, so a reservation older than `T` cannot belong to a live
-request. Postgres `now()` is the only clock involved. If the timeout assumption were
-ever violated, the close token would still prevent a double charge.
+`T = REQUEST_TIMEOUT + RECONCILE_GRACE` (default 30s, at least `LEDGER_TIMEOUT`, since the
+gateway's own close may run that long past the deadline). The gateway enforces
+`REQUEST_TIMEOUT` as a hard deadline on every request, so a reservation older than `T`
+cannot belong to a live request. Postgres `now()` is the only clock involved. If the
+timeout assumption were ever violated, the close token would still prevent a double
+charge. A pass pages through all orphans by key, so one it cannot resolve does not hide
+the ones behind it. Each pass reads every old reserve entry, so its cost grows with the
+ledger; a watermark would bound it if that ever matters.
 
-For each orphan, it asks the `UsageSource` for that request ID:
+For each orphan, it looks up every target on the reserve entry that has a `usage_url`:
 
 | Lookup result | Action |
 |---|---|
-| Mock: billable record found | `settle` using the record's provider, model, and tokens, priced with the snapshot in the reserve's `meta`; `source='reconciler'` |
-| Mock: no billable record (call never happened, or failed before the first token) | `release(R)`, reason `orphan_no_call` |
-| Real provider (no per-request usage API) | `release(R)`, reason `orphan_unknown_usage`; metric + log. **This is an undercharge, by design** |
-| Lookup error (e.g. mock unreachable) | skip; retry on the next pass |
+| A billable record | `settle` the **last** billable attempt, using its provider, model, and tokens, priced with the snapshot in the reserve's `meta`; `source='reconciler'`, reason `completed` or `interrupted` by the record's outcome (§14, D20) |
+| No billable record, and every target could be asked (call never happened, or failed before the first token) | `release(R)`, reason `orphan_no_call` |
+| No billable record, and some target has no `usage_url` (real providers have no per-request usage API) | `release(R)`, reason `orphan_unknown_usage`; log. No record then does not show that no call happened. **This is an undercharge, by design** |
+| Lookup error (e.g. mock unreachable), or a billed model missing from the snapshot | skip; retry on the next pass rather than guess |
+
+`orphan_no_call` trusts a missing record, so a usage source must be complete: the mock
+reloads its usage file at startup for this reason (§11).
+
+**Audit.** `scripts/reconcile_check` (`make reconcile-check`) recomputes what the ledger
+claims from its entries, without writing anything, and exits 1 if a check fails. Run it
+with traffic stopped:
+
+| Check | Fails when |
+|---|---|
+| `account_totals` | `key_accounts` differs from what the entries derive |
+| `structure` | a close or charge has no reserve, or a charge has no close |
+| `close_amount` | a release does not equal `max(R − A, 0)`, or `R` with no charge |
+| `cost` | a charge differs from its tokens at the reservation's price snapshot |
+| `provider_usage` (with `-mock-url`) | a charge differs from the provider's record of the attempt that served it. Estimated charges are counted, not compared |
+| `open` (with `-require-closed`) | a reservation is still open |
+
+It reports gateway and reconciler charges separately, because the reconciler charges from
+the provider's records and so agrees with them by construction.
 
 **Change from what I proposed earlier:** I had suggested a separate `usage_captured`
 entry written before settling. Because settle runs right after usage is captured, that
@@ -739,8 +765,8 @@ added in Phase 2 for adapter tests).
   recorded *before* its final bytes (`[DONE]` / the JSON body) are written, so a caller
   that has read the whole response can always find the record. Queried with
   `GET /_mock/usage?request_id=` and exported with `GET /_mock/usage`.
-- Records are kept in memory and optionally appended to JSONL, so they survive a mock
-  restart. Chaos tests kill only the gateway.
+- Records are kept in memory and optionally appended to JSONL (`MOCK_USAGE_FILE`), which
+  is reloaded at startup, so they survive a mock restart.
 
 ## 12. Guarantees and non-guarantees
 
@@ -751,7 +777,8 @@ added in Phase 2 for adapter tests).
 - No failover after the first byte reaches the client. The client never receives output
   from two providers in one response.
 - Every reservation is eventually closed by the gateway or the reconciler. No reservation
-  stays open longer than `T` + one reconciler interval while Postgres is up.
+  stays open longer than `T` + one reconciler interval while Postgres and its targets'
+  usage sources are up.
 - Against the mock, the settled cost per request equals the mock's recorded usage, except
   for requests marked `estimated`.
 
@@ -760,6 +787,9 @@ added in Phase 2 for adapter tests).
   may have generated tokens that were still in flight and never reached us.
 - With real providers, requests orphaned by a crash are released, which **undercharges**
   the client.
+- With the mock, a request orphaned while a non-streaming attempt was collecting is
+  charged for that attempt's tokens, though the client received nothing. The usage record
+  cannot show what reached the client.
 - Attempts abandoned during failover may be billed by the provider but are not charged to
   the client. That cost falls on the gateway operator.
 - Spend can exceed the budget by the estimation error of in-flight requests.
@@ -787,7 +817,7 @@ by the gateway, compared against the mock, (b) no request being closed twice, an
 ```
 cmd/gateway/          main: public + admin listeners, reconciler loop
 cmd/mockprovider/     mock provider service
-cmd/reconcile/        one-shot reconciler CLI
+cmd/reconcile/        one-shot reconciler CLI, for when the gateway is down
 internal/config/      env + routes file
 internal/httpapi/     handlers, OpenAI wire types, SSE writer, error mapping
 internal/auth/        key hashing, lookup, cache
@@ -840,3 +870,11 @@ Decided during Phase 4:
 | D16 | Requests are closed in a tracked background task, not in the handler | A running handler holds the response open: a stream's terminating chunk, and the next request on a keep-alive connection, would wait for Postgres for as long as settlement retried. Refines D7. Cost: a task to drain at shutdown, and one possible spurious 402 near the budget (§12). |
 | D17 | Reserve, settle, and release are each one SQL statement | Atomic with one round trip, where §8.4 first described a three-statement transaction. Behaviour is unchanged. |
 | D18 | Idempotent settle and its retries were built in Phase 4, not Phase 5 | Budgets cannot work without closing requests, and a non-idempotent close would only have been replaced. Phase 5 keeps the reconciler, usage reads, and `reconcile_check`. |
+
+Decided during Phase 5:
+
+| # | Decision | Reason |
+|---|---|---|
+| D19 | A provider opts in to usage lookups with `usage_url` in the route table | The reconciler must tell "this provider says no call happened" from "we cannot ask". One field per provider keeps that decision in the route table, and a request whose targets mix both kinds is treated as unknown. |
+| D20 | The reconciler charges the last billable attempt | The last attempt is the one that was serving the client when the gateway stopped; earlier attempts failed over, and those are not charged (§10). |
+| D21 | Append-only is enforced by triggers only, not also by grants | §8.2 first said the app role would have no UPDATE/DELETE grant, but the gateway connects as the database owner, which also runs migrations. A separate least-privilege role needs a second database URL. Cost: anyone with owner access can disable the triggers. Worth adding in a real deployment. |
