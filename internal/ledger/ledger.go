@@ -36,6 +36,9 @@ const (
 	ReasonFailed      = "failed"      // released: no attempt committed
 	ReasonRejected    = "rejected"    // released: the upstream refused the client's request
 	ReasonCancelled   = "cancelled"   // released: the client left before the commit point
+
+	ReasonOrphanNoCall       = "orphan_no_call"       // reconciler released: the upstream billed nothing
+	ReasonOrphanUnknownUsage = "orphan_unknown_usage" // reconciler released: usage cannot be known, an undercharge
 )
 
 // TargetPrice is a target's price at reservation time. The reconciler

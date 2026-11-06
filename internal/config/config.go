@@ -35,6 +35,9 @@ type Config struct {
 	RateLimitTimeout time.Duration // RATELIMIT_TIMEOUT: the most a Redis call may add to a request
 	LedgerTimeout    time.Duration // LEDGER_TIMEOUT: each Postgres call on the money path
 
+	ReconcileInterval time.Duration // RECONCILE_INTERVAL: time between passes; 0 runs them only on demand
+	ReconcileGrace    time.Duration // RECONCILE_GRACE: margin past REQUEST_TIMEOUT before a reservation counts as orphaned
+
 	// Failover (design §6.4).
 	MaxAttempts        int           // MAX_ATTEMPTS: upstream attempts per request, across all candidates
 	AttemptTTFTTimeout time.Duration // ATTEMPT_TTFT_TIMEOUT: from the upstream call to its first output
@@ -87,6 +90,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RateLimitTimeout: r.duration("RATELIMIT_TIMEOUT", 250*time.Millisecond),
 		LedgerTimeout:    r.duration("LEDGER_TIMEOUT", 5*time.Second),
 
+		ReconcileInterval: r.duration("RECONCILE_INTERVAL", 30*time.Second),
+		ReconcileGrace:    r.duration("RECONCILE_GRACE", 30*time.Second),
+
 		MaxAttempts:        int(r.int64("MAX_ATTEMPTS", 3)),
 		AttemptTTFTTimeout: r.duration("ATTEMPT_TTFT_TIMEOUT", 10*time.Second),
 		StreamIdleTimeout:  r.duration("STREAM_IDLE_TIMEOUT", 30*time.Second),
@@ -119,6 +125,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	check(cfg.RateLimitTimeout > 0, "RATELIMIT_TIMEOUT must be positive")
 	check(cfg.LedgerTimeout > 0, "LEDGER_TIMEOUT must be positive")
+
+	check(cfg.ReconcileInterval >= 0, "RECONCILE_INTERVAL must be >= 0")
+	// The gateway's own close may run LEDGER_TIMEOUT past the request deadline.
+	check(cfg.ReconcileGrace >= cfg.LedgerTimeout, "RECONCILE_GRACE must be >= LEDGER_TIMEOUT")
 
 	check(cfg.MaxAttempts >= 1, "MAX_ATTEMPTS must be at least 1")
 	check(cfg.AttemptTTFTTimeout > 0, "ATTEMPT_TTFT_TIMEOUT must be positive")

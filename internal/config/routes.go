@@ -56,6 +56,10 @@ type ProviderSpec struct {
 	// compatible servers) or max_completion_tokens (required by newer
 	// OpenAI models).
 	MaxTokensField string `yaml:"max_tokens_field"`
+	// UsageURL is where the reconciler can look up what the provider billed
+	// for a request (design §9). Only the mock has such an API; real
+	// providers leave this empty, and their orphaned requests are released.
+	UsageURL string `yaml:"usage_url"`
 }
 
 // ModelSpec is one public model alias.
@@ -135,8 +139,11 @@ func (r Routes) Validate() error {
 		default:
 			add("provider %q: unsupported format %q", p.Name, p.Format)
 		}
-		if u, err := url.Parse(p.BaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		if !absoluteURL(p.BaseURL) {
 			add("provider %q: base_url must be an absolute http(s) URL", p.Name)
+		}
+		if p.UsageURL != "" && !absoluteURL(p.UsageURL) {
+			add("provider %q: usage_url must be an absolute http(s) URL", p.Name)
 		}
 	}
 
@@ -178,6 +185,11 @@ func (r Routes) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func absoluteURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 // maxPricePerMTok keeps micro-USD prices far from int64 overflow in cost math.

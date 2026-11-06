@@ -32,6 +32,9 @@ func TestLoadDefaults(t *testing.T) {
 	if !cfg.MigrateOnStart || cfg.LogLevel != slog.LevelInfo || cfg.MaxBodyBytes != 4<<20 || cfg.EstImageTokens != 1000 {
 		t.Errorf("unexpected defaults: %+v", cfg)
 	}
+	if cfg.ReconcileInterval != 30*time.Second || cfg.ReconcileGrace != 30*time.Second {
+		t.Errorf("reconciler defaults: %+v", cfg)
+	}
 	if cfg.EstSafetyFactor != 1.25 || cfg.RateLimitTimeout != 250*time.Millisecond || cfg.LedgerTimeout != 5*time.Second {
 		t.Errorf("accounting defaults: %+v", cfg)
 	}
@@ -84,12 +87,13 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		"MAX_ATTEMPTS":         "0",
 		"BREAKER_COOLDOWN":     "10s",
 		"BREAKER_MAX_COOLDOWN": "5s",
+		"RECONCILE_GRACE":      "1s",
 	}))
 	if err == nil {
 		t.Fatal("expected error")
 	}
 	for _, want := range []string{"DATABASE_URL", "REDIS_URL", "ROUTES_FILE", "AUTH_CACHE_TTL", "LOG_LEVEL",
-		"EWMA_ALPHA", "ROUTE_EXPLORE_RATE", "MAX_ATTEMPTS", "BREAKER_MAX_COOLDOWN"} {
+		"EWMA_ALPHA", "ROUTE_EXPLORE_RATE", "MAX_ATTEMPTS", "BREAKER_MAX_COOLDOWN", "RECONCILE_GRACE"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}

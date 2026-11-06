@@ -66,7 +66,7 @@ func TestParseRoutesErrors(t *testing.T) {
 providers:
   - { name: p, format: gemini, base_url: "ftp://x" }
   - { name: p, format: openai, base_url: "http://x/v1", max_tokens_field: tokens }
-  - { name: q, format: anthropic, base_url: "http://x/v1", max_tokens_field: max_tokens }
+  - { name: q, format: anthropic, base_url: "http://x/v1", max_tokens_field: max_tokens, usage_url: "nope" }
 models:
   - alias: a
     policy: quickest
@@ -77,7 +77,7 @@ models:
 `,
 			want: []string{
 				`unsupported format "gemini"`, "base_url", `duplicate name "p"`,
-				"max_tokens_field must be", "applies only to the openai format",
+				"max_tokens_field must be", "applies only to the openai format", "usage_url must be",
 				`unsupported policy "quickest"`, `unknown provider "nope"`, "model is required",
 				"prices must be", "max_output must be positive", `duplicate alias "a"`,
 				"at least one candidate",
