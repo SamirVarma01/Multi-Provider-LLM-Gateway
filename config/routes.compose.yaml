@@ -1,8 +1,8 @@
 # Route table for docker compose: two virtual providers on the mock service.
 providers:
-  - { name: mock-a, format: openai, base_url: "http://mock:9000/p/mock-a/v1" }
-  - { name: mock-b, format: openai, base_url: "http://mock:9000/p/mock-b/v1" }
-  - { name: mock-claude, format: anthropic, base_url: "http://mock:9000/p/mock-claude/v1" }
+  - { name: mock-a, format: openai, base_url: "http://mock:9000/p/mock-a/v1", usage_url: "http://mock:9000" }
+  - { name: mock-b, format: openai, base_url: "http://mock:9000/p/mock-b/v1", usage_url: "http://mock:9000" }
+  - { name: mock-claude, format: anthropic, base_url: "http://mock:9000/p/mock-claude/v1", usage_url: "http://mock:9000" }
 
 models:
   - alias: mock-small

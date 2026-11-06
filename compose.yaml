@@ -53,6 +53,9 @@ services:
       ROUTES_FILE: /etc/gateway/routes.compose.yaml
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-10m}
+      RECONCILE_GRACE: ${RECONCILE_GRACE:-30s}
+      RECONCILE_INTERVAL: ${RECONCILE_INTERVAL:-30s}
     ports:
       - "127.0.0.1:${GATEWAY_PORT:-8080}:8080"
       - "127.0.0.1:${GATEWAY_ADMIN_PORT:-8081}:8081"
@@ -63,6 +66,21 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  # One reconciler pass, for when the gateway itself is down:
+  #   docker compose run --rm --build reconcile
+  # It has no depends_on on purpose: compose would rebuild and recreate those
+  # services, and this runs after a crash, when nothing else should change.
+  reconcile:
+    profiles: [tools]
+    build: { context: ., args: { CMD: reconcile } }
+    environment:
+      DATABASE_URL: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      ROUTES_FILE: /etc/gateway/routes.compose.yaml
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-10m}
+      RECONCILE_GRACE: ${RECONCILE_GRACE:-30s}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
 
 volumes:
   pgdata:

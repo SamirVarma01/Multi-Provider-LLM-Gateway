@@ -39,6 +39,17 @@ type Ledger interface {
 	Release(ctx context.Context, requestID uuid.UUID, reason, source string) (bool, error)
 }
 
+// Reconciler runs a pass over orphaned reservations (design §9).
+type Reconciler interface {
+	RunOnce(ctx context.Context) (ledger.Result, error)
+}
+
+// Reports reads a key's usage from the ledger.
+type Reports interface {
+	Usage(ctx context.Context, keyID uuid.UUID, from, to *time.Time) (ledger.Usage, error)
+	Entries(ctx context.Context, keyID uuid.UUID, limit int, before int64) ([]ledger.Entry, error)
+}
+
 // admission is what a request took when it was let in, which closing it
 // settles up.
 type admission struct {

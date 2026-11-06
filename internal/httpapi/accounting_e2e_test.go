@@ -16,9 +16,11 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/SamirVarma01/llm-gateway/internal/auth"
+	"github.com/SamirVarma01/llm-gateway/internal/config"
 	"github.com/SamirVarma01/llm-gateway/internal/ledger"
 	"github.com/SamirVarma01/llm-gateway/internal/mock"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
+	"github.com/SamirVarma01/llm-gateway/internal/provider"
 	"github.com/SamirVarma01/llm-gateway/internal/ratelimit"
 	"github.com/SamirVarma01/llm-gateway/internal/testutil"
 )
@@ -32,16 +34,29 @@ type realEnv struct {
 
 func newRealEnv(t *testing.T, b mock.Behavior, limiter RateLimiter) *realEnv {
 	t.Helper()
+	return newRealEnvTweaked(t, b, limiter, nil)
+}
+
+func newRealEnvTweaked(t *testing.T, b mock.Behavior, limiter RateLimiter, tweak func(o *Options, pool *pgxpool.Pool, mockURL string)) *realEnv {
+	t.Helper()
 	pool := testutil.NewDatabase(t)
 	store := auth.NewPGStore(pool)
 	if limiter == nil {
 		limiter = ratelimit.New(testutil.NewRedis(t), 2*time.Second)
 	}
-	e := newEnv(t, b, func(o *Options) {
-		o.Keys = store
-		o.Auth = auth.NewCache(store, time.Minute)
-		o.Ledger = ledger.New(pool)
-		o.Limiter = limiter
+	e := newEnvTweaked(t, b, envTweak{
+		server: func(o *Options) {
+			o.Keys = store
+			o.Auth = auth.NewCache(store, time.Minute)
+			o.Ledger = ledger.New(pool)
+			o.Reports = ledger.New(pool)
+			o.Limiter = limiter
+		},
+		mock: func(o *Options, mockURL string) {
+			if tweak != nil {
+				tweak(o, pool, mockURL)
+			}
+		},
 	})
 	return &realEnv{testEnv: e, pool: pool, store: store}
 }
@@ -317,4 +332,148 @@ func TestE2EUpdateKey(t *testing.T) {
 	wantError(t, e.chatAs(t, plaintext, chatReq("chat", nil)), http.StatusPaymentRequired, "insufficient_budget")
 	patch(`{"budget_usd": null}`)
 	readBody(t, e.chatAs(t, plaintext, chatReq("chat", nil)), false)
+}
+
+// crashedLedger keeps reservations but loses every close, which is what the
+// ledger sees when the gateway dies after serving a request.
+type crashedLedger struct{ *ledger.Ledger }
+
+func (crashedLedger) Settle(context.Context, ledger.Settlement) (bool, error) { return true, nil }
+func (crashedLedger) Release(context.Context, uuid.UUID, string, string) (bool, error) {
+	return true, nil
+}
+
+func TestE2EReconcilerClosesWhatACrashLeftOpen(t *testing.T) {
+	e := newRealEnvTweaked(t, mock.Behavior{OutputTokens: 4}, nil, func(o *Options, pool *pgxpool.Pool, mockURL string) {
+		led := ledger.New(pool)
+		o.Ledger = crashedLedger{led}
+		tr := &http.Transport{}
+		t.Cleanup(tr.CloseIdleConnections)
+		sources := ledger.UsageSources([]config.ProviderSpec{
+			{Name: "mock-a", UsageURL: mockURL}, {Name: "mock-b", UsageURL: mockURL},
+		}, &http.Client{Transport: tr, Timeout: 5 * time.Second})
+		o.Reconciler = ledger.NewReconciler(led, sources, 0, obs.NewLogger(io.Discard, 0))
+	})
+	k, plaintext := e.newKey(t, auth.NewKey{})
+
+	// Served in full.
+	resp := e.chatAs(t, plaintext, chatReq("pair", nil))
+	complete := resp.Header.Get(obs.RequestIDHeader)
+	readBody(t, resp, false)
+	e.outcome(t)
+
+	// Cut off after 3 tokens: billed for those, by the provider and by us.
+	setBehavior(t, e.testEnv, "mock-a", mock.Behavior{OutputTokens: 10, FailAfterTokens: 3})
+	body := chatReq("pair", nil)
+	body.Stream = true
+	resp = e.chatAs(t, plaintext, body)
+	cut := resp.Header.Get(obs.RequestIDHeader)
+	readClientStream(resp.Body)
+	e.outcome(t)
+
+	// Every attempt failed before any output: nothing billed.
+	failing := mock.Behavior{ErrorRate: 1, ErrorStatus: 503}
+	setBehavior(t, e.testEnv, "mock-a", failing)
+	setBehavior(t, e.testEnv, "mock-b", failing)
+	resp = e.chatAs(t, plaintext, chatReq("pair", nil))
+	failed := resp.Header.Get(obs.RequestIDHeader)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	e.outcome(t)
+
+	if spent, held := e.totals(t, k.ID); spent != 0 || held == 0 {
+		t.Fatalf("before reconciling: spent %d held %d", spent, held)
+	}
+	reconcile := func() ledger.Result {
+		return decode[ledger.Result](t, e.do(t, http.MethodPost, e.admin.URL+"/admin/reconcile", adminToken, nil))
+	}
+	if res := reconcile(); res.Orphans != 3 || res.Settled != 2 || res.ReleasedNoCall != 1 || res.Failed != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+
+	var want int64
+	for _, id := range []string{complete, cut} {
+		rec := e.mock.Records(id)[0]
+		want += ledger.Cost(rec.PromptTokens, rec.CompletionTokens, provider.Price{InputMicroPerM: 1_000_000, OutputMicroPerM: 2_000_000})
+	}
+	if spent, held := e.totals(t, k.ID); spent != want || held != 0 {
+		t.Errorf("spent %d held %d, want %d and 0", spent, held, want)
+	}
+	if n := e.entryCount(t, failed); n != 2 {
+		t.Errorf("a request that billed nothing has %d entries, want reserve and release", n)
+	}
+	if res := reconcile(); res.Orphans != 0 {
+		t.Errorf("second pass found %+v", res)
+	}
+}
+
+func TestE2EUsageAndLedgerEndpoints(t *testing.T) {
+	e := newRealEnv(t, mock.Behavior{OutputTokens: 4}, nil)
+	budget := int64(1_000_000_000) // $1
+	k, plaintext := e.newKey(t, auth.NewKey{BudgetNUSD: &budget})
+	url := e.admin.URL + "/admin/keys/" + k.ID.String()
+
+	var want int64
+	var records []mock.Record
+	for range 2 {
+		resp := e.chatAs(t, plaintext, chatReq("chat", nil))
+		reqID := resp.Header.Get(obs.RequestIDHeader)
+		readBody(t, resp, false)
+		e.outcome(t)
+		rec := waitRecords(t, e.mock, reqID, 1)[0]
+		records = append(records, rec)
+		want += ledger.Cost(rec.PromptTokens, rec.CompletionTokens, smallPrice)
+	}
+
+	u := decode[usageResponse](t, e.do(t, http.MethodGet, url+"/usage", adminToken, nil))
+	if u.KeyID != k.ID || u.SpentNUSD != want || u.TotalSpentNUSD != want || u.HeldNUSD != 0 || u.Requests != 2 {
+		t.Errorf("usage = %+v, want %d spent", u, want)
+	}
+	if *u.BudgetUSD != 1 || *u.AvailableNUSD != budget-want || u.SpentUSD != float64(want)/1e9 {
+		t.Errorf("usage = %+v", u)
+	}
+	if len(u.Groups) != 1 {
+		t.Fatalf("groups = %+v", u.Groups)
+	}
+	g := u.Groups[0]
+	if g.Alias != "chat" || g.Provider != "mock-a" || g.UpstreamModel != "m-small" || g.Requests != 2 ||
+		g.CompletionTokens != int64(records[0].CompletionTokens+records[1].CompletionTokens) {
+		t.Errorf("group = %+v", g)
+	}
+
+	// A window after the requests: nothing in it, current figures unchanged.
+	from := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	u = decode[usageResponse](t, e.do(t, http.MethodGet, url+"/usage?from="+from, adminToken, nil))
+	if u.SpentNUSD != 0 || u.Requests != 0 || len(u.Groups) != 0 || u.TotalSpentNUSD != want {
+		t.Errorf("empty window = %+v", u)
+	}
+
+	// Two requests make 6 entries; page through them.
+	page := decode[ledgerResponse](t, e.do(t, http.MethodGet, url+"/ledger?limit=4", adminToken, nil))
+	if len(page.Data) != 4 || page.NextBefore == nil {
+		t.Fatalf("first page = %+v", page)
+	}
+	rest := decode[ledgerResponse](t, e.do(t, http.MethodGet,
+		url+"/ledger?limit=4&before="+strconv.FormatInt(*page.NextBefore, 10), adminToken, nil))
+	if len(rest.Data) != 2 || rest.NextBefore != nil {
+		t.Errorf("second page = %+v", rest)
+	}
+
+	for _, tt := range []struct {
+		path   string
+		status int
+		code   string
+	}{
+		{"/usage?from=yesterday", 400, "invalid_time"},
+		{"/usage?to=soon", 400, "invalid_time"},
+		{"/ledger?limit=0", 400, "invalid_limit"},
+		{"/ledger?limit=5000", 400, "invalid_limit"},
+		{"/ledger?before=x", 400, "invalid_before"},
+	} {
+		wantError(t, e.do(t, http.MethodGet, url+tt.path, adminToken, nil), tt.status, tt.code)
+	}
+	unknown := e.admin.URL + "/admin/keys/" + uuid.NewString()
+	wantError(t, e.do(t, http.MethodGet, unknown+"/usage", adminToken, nil), 404, "key_not_found")
+	wantError(t, e.do(t, http.MethodGet, unknown+"/ledger", adminToken, nil), 404, "key_not_found")
+	wantError(t, e.do(t, http.MethodGet, e.admin.URL+"/admin/keys/nope/usage", adminToken, nil), 400, "invalid_id")
+	wantError(t, e.do(t, http.MethodGet, e.admin.URL+"/admin/keys/nope/ledger", adminToken, nil), 400, "invalid_id")
 }

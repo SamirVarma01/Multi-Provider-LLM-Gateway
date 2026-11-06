@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Builds one binary from ./cmd/${CMD} (gateway or mockprovider).
+# Builds one binary from ./cmd/${CMD} (gateway, mockprovider, or reconcile).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./

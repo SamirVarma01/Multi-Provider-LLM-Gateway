@@ -83,14 +83,19 @@ func run() error {
 	defer rdb.Close()
 
 	keys := auth.NewPGStore(pool)
+	led := ledger.New(pool)
+	usage := ledger.UsageSources(routes.Providers, &http.Client{Timeout: 5 * time.Second})
+	reconciler := ledger.NewReconciler(led, usage, cfg.RequestTimeout+cfg.ReconcileGrace, logger)
 	api := httpapi.New(httpapi.Options{
-		Logger:    logger,
-		Auth:      auth.NewCache(keys, cfg.AuthCacheTTL),
-		Keys:      keys,
-		Router:    rt,
-		Estimator: estimate.Estimator{ImageTokens: cfg.EstImageTokens, SafetyFactor: cfg.EstSafetyFactor},
-		Limiter:   ratelimit.New(rdb, cfg.RateLimitTimeout),
-		Ledger:    ledger.New(pool),
+		Logger:     logger,
+		Auth:       auth.NewCache(keys, cfg.AuthCacheTTL),
+		Keys:       keys,
+		Router:     rt,
+		Estimator:  estimate.Estimator{ImageTokens: cfg.EstImageTokens, SafetyFactor: cfg.EstSafetyFactor},
+		Limiter:    ratelimit.New(rdb, cfg.RateLimitTimeout),
+		Ledger:     led,
+		Reconciler: reconciler,
+		Reports:    led,
 		Ready: []httpapi.ReadyCheck{
 			{Name: "postgres", Check: pool.Ping},
 			{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
@@ -115,6 +120,12 @@ func run() error {
 			if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 				return fmt.Errorf("listen %s: %w", srv.Addr, err)
 			}
+			return nil
+		})
+	}
+	if cfg.ReconcileInterval > 0 {
+		g.Go(func() error {
+			reconciler.Run(gctx, cfg.ReconcileInterval)
 			return nil
 		})
 	}
