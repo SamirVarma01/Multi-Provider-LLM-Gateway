@@ -21,6 +21,7 @@ import (
 
 // UsageRecord is a provider's account of one attempt at a request.
 type UsageRecord struct {
+	RequestID        string `json:"request_id"`
 	Provider         string `json:"provider"`
 	Model            string `json:"model"`
 	Attempt          int    `json:"attempt"`
@@ -310,10 +311,8 @@ func (r *Reconciler) lookup(ctx context.Context, o orphan) (billed *UsageRecord,
 		if err != nil {
 			return nil, false, errors.Join(fmt.Errorf("usage lookup for %s", t.Provider), err)
 		}
-		for i := range recs {
-			if recs[i].Billable && (billed == nil || recs[i].Attempt > billed.Attempt) {
-				billed = &recs[i]
-			}
+		if last := lastBillable(recs); last != nil && (billed == nil || last.Attempt > billed.Attempt) {
+			billed = last
 		}
 	}
 	return billed, unknown, nil

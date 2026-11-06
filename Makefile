@@ -1,4 +1,4 @@
-.PHONY: build test test-integration test-live vet up down logs smoke reconcile
+.PHONY: build test test-integration test-live vet up down logs smoke reconcile reconcile-check
 
 build:
 	go build ./...
@@ -35,3 +35,10 @@ smoke:
 # One reconciler pass from outside the gateway, for when it is down.
 reconcile:
 	docker compose run --rm --build reconcile
+
+# Audit the Compose stack's ledger against the mock. Run it with traffic
+# stopped. CHECK_FLAGS=-require-closed also fails on open reservations.
+reconcile-check:
+	DATABASE_URL=postgres://gateway:gateway@127.0.0.1:$${PG_PORT:-5432}/gateway?sslmode=disable \
+	MOCK_URL=http://127.0.0.1:$${MOCK_PORT:-9000} \
+	go run ./scripts/reconcile_check $(CHECK_FLAGS)
