@@ -29,7 +29,8 @@ type Config struct {
 	ShutdownDrainTimeout time.Duration // SHUTDOWN_DRAIN_TIMEOUT
 	MaxBodyBytes         int64         // MAX_BODY_BYTES
 
-	EstImageTokens int // EST_IMAGE_TOKENS: tokens assumed per input image when estimating
+	EstImageTokens  int     // EST_IMAGE_TOKENS: tokens assumed per input image when estimating
+	EstSafetyFactor float64 // EST_SAFETY_FACTOR: margin on the input estimate used to reserve
 
 	// Failover (design §6.4).
 	MaxAttempts        int           // MAX_ATTEMPTS: upstream attempts per request, across all candidates
@@ -78,6 +79,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		ShutdownDrainTimeout: r.duration("SHUTDOWN_DRAIN_TIMEOUT", 30*time.Second),
 		MaxBodyBytes:         r.int64("MAX_BODY_BYTES", 4<<20),
 		EstImageTokens:       int(r.int64("EST_IMAGE_TOKENS", 1000)),
+		EstSafetyFactor:      r.float("EST_SAFETY_FACTOR", 1.25),
 
 		MaxAttempts:        int(r.int64("MAX_ATTEMPTS", 3)),
 		AttemptTTFTTimeout: r.duration("ATTEMPT_TTFT_TIMEOUT", 10*time.Second),
@@ -107,6 +109,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	check(cfg.RequestTimeout > 0, "REQUEST_TIMEOUT must be positive")
 	check(cfg.MaxBodyBytes > 0, "MAX_BODY_BYTES must be positive")
 	check(cfg.EstImageTokens >= 0, "EST_IMAGE_TOKENS must be >= 0")
+	check(cfg.EstSafetyFactor >= 1, "EST_SAFETY_FACTOR must be at least 1")
 
 	check(cfg.MaxAttempts >= 1, "MAX_ATTEMPTS must be at least 1")
 	check(cfg.AttemptTTFTTimeout > 0, "ATTEMPT_TTFT_TIMEOUT must be positive")
