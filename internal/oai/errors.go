@@ -14,6 +14,8 @@ const (
 	ErrTypeInvalidRequest = "invalid_request_error"
 	ErrTypeAuthentication = "authentication_error"
 	ErrTypeNotFound       = "not_found_error"
+	ErrTypeRateLimit      = "rate_limit_error"
+	ErrTypeBudget         = "insufficient_quota"
 	ErrTypeUpstream       = "upstream_error"
 	ErrTypeAPI            = "api_error"
 )

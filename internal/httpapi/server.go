@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,10 +37,13 @@ type Options struct {
 	Auth           auth.Lookuper
 	Keys           KeyAdmin
 	Router         *router.Router
-	Estimator      estimate.Estimator // fills in usage providers do not report
+	Estimator      estimate.Estimator // sizes reservations; fills in usage providers do not report
+	Limiter        RateLimiter
+	Ledger         Ledger
 	Ready          []ReadyCheck
 	AdminToken     string
 	RequestTimeout time.Duration
+	LedgerTimeout  time.Duration // each ledger call
 	MaxBodyBytes   int64
 }
 
@@ -48,7 +52,11 @@ type Server struct {
 	opts Options
 	now  func() time.Time
 
-	onOutcome func(outcome) // test hook, called with every chat request's outcome
+	inflight atomic.Int64    // background accounting tasks
+	stopping context.Context // ended by Drain when its time runs out
+	stop     context.CancelFunc
+
+	onOutcome func(outcome) // test hook, called once a chat request is fully accounted for
 }
 
 // New returns a Server.
@@ -56,7 +64,8 @@ func New(opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Server{opts: opts, now: time.Now}
+	stopping, stop := context.WithCancel(context.Background())
+	return &Server{opts: opts, now: time.Now, stopping: stopping, stop: stop}
 }
 
 // PublicHandler serves /v1/*, /healthz and /readyz.

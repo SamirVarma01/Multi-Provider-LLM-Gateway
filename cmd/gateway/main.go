@@ -23,7 +23,9 @@ import (
 	"github.com/SamirVarma01/llm-gateway/internal/db"
 	"github.com/SamirVarma01/llm-gateway/internal/estimate"
 	"github.com/SamirVarma01/llm-gateway/internal/httpapi"
+	"github.com/SamirVarma01/llm-gateway/internal/ledger"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
+	"github.com/SamirVarma01/llm-gateway/internal/ratelimit"
 	"github.com/SamirVarma01/llm-gateway/internal/router"
 	"github.com/SamirVarma01/llm-gateway/migrations"
 )
@@ -76,6 +78,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("REDIS_URL: %w", err)
 	}
+	redisOpts.ContextTimeoutEnabled = true // RATELIMIT_TIMEOUT must reach the socket
 	rdb := redis.NewClient(redisOpts)
 	defer rdb.Close()
 
@@ -85,13 +88,16 @@ func run() error {
 		Auth:      auth.NewCache(keys, cfg.AuthCacheTTL),
 		Keys:      keys,
 		Router:    rt,
-		Estimator: estimate.Estimator{ImageTokens: cfg.EstImageTokens},
+		Estimator: estimate.Estimator{ImageTokens: cfg.EstImageTokens, SafetyFactor: cfg.EstSafetyFactor},
+		Limiter:   ratelimit.New(rdb, cfg.RateLimitTimeout),
+		Ledger:    ledger.New(pool),
 		Ready: []httpapi.ReadyCheck{
 			{Name: "postgres", Check: pool.Ping},
 			{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
 		},
 		AdminToken:     cfg.AdminToken,
 		RequestTimeout: cfg.RequestTimeout,
+		LedgerTimeout:  cfg.LedgerTimeout,
 		MaxBodyBytes:   cfg.MaxBodyBytes,
 	})
 
@@ -119,6 +125,12 @@ func run() error {
 		return nil
 	})
 	err = g.Wait()
+
+	// The servers are down, so nothing new can start. Settlement normally
+	// takes milliseconds; a request not closed in time goes to the reconciler.
+	drain, cancel := context.WithTimeout(context.Background(), cfg.LedgerTimeout)
+	defer cancel()
+	api.Drain(drain)
 	logger.Info("stopped")
 	return err
 }
