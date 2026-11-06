@@ -49,6 +49,7 @@ func newRealEnvTweaked(t *testing.T, b mock.Behavior, limiter RateLimiter, tweak
 			o.Keys = store
 			o.Auth = auth.NewCache(store, time.Minute)
 			o.Ledger = ledger.New(pool)
+			o.Reports = ledger.New(pool)
 			o.Limiter = limiter
 		},
 		mock: func(o *Options, mockURL string) {
@@ -403,4 +404,76 @@ func TestE2EReconcilerClosesWhatACrashLeftOpen(t *testing.T) {
 	if res := reconcile(); res.Orphans != 0 {
 		t.Errorf("second pass found %+v", res)
 	}
+}
+
+func TestE2EUsageAndLedgerEndpoints(t *testing.T) {
+	e := newRealEnv(t, mock.Behavior{OutputTokens: 4}, nil)
+	budget := int64(1_000_000_000) // $1
+	k, plaintext := e.newKey(t, auth.NewKey{BudgetNUSD: &budget})
+	url := e.admin.URL + "/admin/keys/" + k.ID.String()
+
+	var want int64
+	var records []mock.Record
+	for range 2 {
+		resp := e.chatAs(t, plaintext, chatReq("chat", nil))
+		reqID := resp.Header.Get(obs.RequestIDHeader)
+		readBody(t, resp, false)
+		e.outcome(t)
+		rec := waitRecords(t, e.mock, reqID, 1)[0]
+		records = append(records, rec)
+		want += ledger.Cost(rec.PromptTokens, rec.CompletionTokens, smallPrice)
+	}
+
+	u := decode[usageResponse](t, e.do(t, http.MethodGet, url+"/usage", adminToken, nil))
+	if u.KeyID != k.ID || u.SpentNUSD != want || u.TotalSpentNUSD != want || u.HeldNUSD != 0 || u.Requests != 2 {
+		t.Errorf("usage = %+v, want %d spent", u, want)
+	}
+	if *u.BudgetUSD != 1 || *u.AvailableNUSD != budget-want || u.SpentUSD != float64(want)/1e9 {
+		t.Errorf("usage = %+v", u)
+	}
+	if len(u.Groups) != 1 {
+		t.Fatalf("groups = %+v", u.Groups)
+	}
+	g := u.Groups[0]
+	if g.Alias != "chat" || g.Provider != "mock-a" || g.UpstreamModel != "m-small" || g.Requests != 2 ||
+		g.CompletionTokens != int64(records[0].CompletionTokens+records[1].CompletionTokens) {
+		t.Errorf("group = %+v", g)
+	}
+
+	// A window after the requests: nothing in it, current figures unchanged.
+	from := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	u = decode[usageResponse](t, e.do(t, http.MethodGet, url+"/usage?from="+from, adminToken, nil))
+	if u.SpentNUSD != 0 || u.Requests != 0 || len(u.Groups) != 0 || u.TotalSpentNUSD != want {
+		t.Errorf("empty window = %+v", u)
+	}
+
+	// Two requests make 6 entries; page through them.
+	page := decode[ledgerResponse](t, e.do(t, http.MethodGet, url+"/ledger?limit=4", adminToken, nil))
+	if len(page.Data) != 4 || page.NextBefore == nil {
+		t.Fatalf("first page = %+v", page)
+	}
+	rest := decode[ledgerResponse](t, e.do(t, http.MethodGet,
+		url+"/ledger?limit=4&before="+strconv.FormatInt(*page.NextBefore, 10), adminToken, nil))
+	if len(rest.Data) != 2 || rest.NextBefore != nil {
+		t.Errorf("second page = %+v", rest)
+	}
+
+	for _, tt := range []struct {
+		path   string
+		status int
+		code   string
+	}{
+		{"/usage?from=yesterday", 400, "invalid_time"},
+		{"/usage?to=soon", 400, "invalid_time"},
+		{"/ledger?limit=0", 400, "invalid_limit"},
+		{"/ledger?limit=5000", 400, "invalid_limit"},
+		{"/ledger?before=x", 400, "invalid_before"},
+	} {
+		wantError(t, e.do(t, http.MethodGet, url+tt.path, adminToken, nil), tt.status, tt.code)
+	}
+	unknown := e.admin.URL + "/admin/keys/" + uuid.NewString()
+	wantError(t, e.do(t, http.MethodGet, unknown+"/usage", adminToken, nil), 404, "key_not_found")
+	wantError(t, e.do(t, http.MethodGet, unknown+"/ledger", adminToken, nil), 404, "key_not_found")
+	wantError(t, e.do(t, http.MethodGet, e.admin.URL+"/admin/keys/nope/usage", adminToken, nil), 400, "invalid_id")
+	wantError(t, e.do(t, http.MethodGet, e.admin.URL+"/admin/keys/nope/ledger", adminToken, nil), 400, "invalid_id")
 }

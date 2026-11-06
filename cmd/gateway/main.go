@@ -95,6 +95,7 @@ func run() error {
 		Limiter:    ratelimit.New(rdb, cfg.RateLimitTimeout),
 		Ledger:     led,
 		Reconciler: reconciler,
+		Reports:    led,
 		Ready: []httpapi.ReadyCheck{
 			{Name: "postgres", Check: pool.Ping},
 			{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
