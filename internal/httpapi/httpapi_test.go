@@ -45,6 +45,9 @@ func (s staticAuth) LookupByHash(_ context.Context, hash []byte) (auth.Key, erro
 type testEnv struct {
 	mock     *mock.Server
 	router   *router.Router
+	srv      *Server
+	ledger   *fakeLedger  // what Options.Ledger defaults to
+	limiter  *fakeLimiter // what Options.Limiter defaults to
 	public   *httptest.Server
 	admin    *httptest.Server
 	key      string
@@ -145,13 +148,17 @@ func newEnvRoutesTweaked(t *testing.T, routesYAML string, tw envTweak) *testEnv 
 	}
 
 	key, _ := auth.GenerateKey()
+	fl, flim := &fakeLedger{}, &fakeLimiter{}
 	opts := Options{
 		Logger:         obs.NewLogger(io.Discard, 0),
 		Auth:           staticAuth{plaintext: key, key: auth.Key{ID: uuid.New(), Name: "test"}},
 		Router:         rt,
-		Estimator:      estimate.Estimator{ImageTokens: 100},
+		Estimator:      estimate.Estimator{ImageTokens: 100, SafetyFactor: 1.25},
+		Limiter:        flim,
+		Ledger:         fl,
 		AdminToken:     adminToken,
 		RequestTimeout: 10 * time.Second,
+		LedgerTimeout:  time.Second,
 		MaxBodyBytes:   1 << 20,
 	}
 	if tw.server != nil {
@@ -165,11 +172,17 @@ func newEnvRoutesTweaked(t *testing.T, routesYAML string, tw envTweak) *testEnv 
 		default: // a test that does not read outcomes must not block handlers
 		}
 	}
+	// Runs after the servers close (cleanups are last in, first out).
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Drain(ctx)
+	})
 	public := httptest.NewServer(srv.PublicHandler())
 	t.Cleanup(public.Close)
 	admin := httptest.NewServer(srv.AdminHandler())
 	t.Cleanup(admin.Close)
-	return &testEnv{router: rt, public: public, admin: admin, key: key, outcomes: outcomes}
+	return &testEnv{router: rt, srv: srv, ledger: fl, limiter: flim, public: public, admin: admin, key: key, outcomes: outcomes}
 }
 
 // outcome waits for the next request outcome.
@@ -213,6 +226,11 @@ func (e *testEnv) do(t *testing.T, method, url, bearer string, body any, headers
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
+}
+
+func jsonBody(v any) io.Reader {
+	raw, _ := json.Marshal(v)
+	return bytes.NewReader(raw)
 }
 
 func (e *testEnv) chat(t *testing.T, body any, headers ...http.Header) *http.Response {

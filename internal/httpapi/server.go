@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,7 @@ import (
 type KeyAdmin interface {
 	CreateKey(ctx context.Context, nk auth.NewKey) (auth.Key, string, error)
 	ListKeys(ctx context.Context) ([]auth.Key, error)
+	UpdateKey(ctx context.Context, id uuid.UUID, u auth.KeyUpdate) (auth.Key, error)
 	RevokeKey(ctx context.Context, id uuid.UUID) (auth.Key, error)
 }
 
@@ -36,10 +38,13 @@ type Options struct {
 	Auth           auth.Lookuper
 	Keys           KeyAdmin
 	Router         *router.Router
-	Estimator      estimate.Estimator // fills in usage providers do not report
+	Estimator      estimate.Estimator // sizes reservations; fills in usage providers do not report
+	Limiter        RateLimiter
+	Ledger         Ledger
 	Ready          []ReadyCheck
 	AdminToken     string
 	RequestTimeout time.Duration
+	LedgerTimeout  time.Duration // each ledger call
 	MaxBodyBytes   int64
 }
 
@@ -48,7 +53,11 @@ type Server struct {
 	opts Options
 	now  func() time.Time
 
-	onOutcome func(outcome) // test hook, called with every chat request's outcome
+	inflight atomic.Int64    // background accounting tasks
+	stopping context.Context // ended by Drain when its time runs out
+	stop     context.CancelFunc
+
+	onOutcome func(outcome) // test hook, called once a chat request is fully accounted for
 }
 
 // New returns a Server.
@@ -56,7 +65,8 @@ func New(opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &Server{opts: opts, now: time.Now}
+	stopping, stop := context.WithCancel(context.Background())
+	return &Server{opts: opts, now: time.Now, stopping: stopping, stop: stop}
 }
 
 // PublicHandler serves /v1/*, /healthz and /readyz.
@@ -76,6 +86,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/keys", s.handleCreateKey)
 	mux.HandleFunc("GET /admin/keys", s.handleListKeys)
+	mux.HandleFunc("PATCH /admin/keys/{id}", s.handleUpdateKey)
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.handleRevokeKey)
 	mux.HandleFunc("/", notFound)
 	return obs.Middleware(s.opts.Logger)(adminAuth(s.opts.AdminToken)(mux))

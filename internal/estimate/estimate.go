@@ -9,6 +9,8 @@
 package estimate
 
 import (
+	"math"
+
 	"github.com/SamirVarma01/llm-gateway/internal/provider"
 )
 
@@ -21,9 +23,13 @@ const (
 // DefaultImageTokens is the tokens assumed per image when not configured.
 const DefaultImageTokens = 1000
 
+// DefaultSafetyFactor is the reservation margin when not configured.
+const DefaultSafetyFactor = 1.25
+
 // Estimator approximates token counts.
 type Estimator struct {
-	ImageTokens int // tokens assumed per input image
+	ImageTokens  int     // tokens assumed per input image
+	SafetyFactor float64 // margin on Reserve; values below 1 mean none
 }
 
 // Text estimates the tokens in s.
@@ -52,6 +58,17 @@ func (e Estimator) Input(req *provider.ChatRequest) int {
 		n += e.Text(t.Name) + e.Text(t.Description) + e.Text(string(t.Parameters))
 	}
 	return n
+}
+
+// Reserve estimates the prompt tokens to admit and reserve for (design §8.3):
+// Input with a safety margin, because the heuristic can undercount and an
+// actual cost above the reservation can overspend the budget.
+func (e Estimator) Reserve(req *provider.ChatRequest) int {
+	n := e.Input(req)
+	if e.SafetyFactor <= 1 {
+		return n
+	}
+	return int(math.Ceil(float64(n) * e.SafetyFactor))
 }
 
 // Output estimates the completion tokens in what was received of a response.

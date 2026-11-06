@@ -78,3 +78,16 @@ func TestResolve(t *testing.T) {
 		})
 	}
 }
+
+func TestReserve(t *testing.T) {
+	req := &provider.ChatRequest{Messages: []provider.Message{
+		{Role: provider.RoleUser, Content: []provider.ContentPart{{Type: provider.PartText, Text: "12345678"}}},
+	}}
+	input := Estimator{}.Input(req) // 3 + 4 + 2 = 9
+	if got := (Estimator{SafetyFactor: 1.25}).Reserve(req); got != 12 {
+		t.Errorf("Reserve = %d, want ceil(9 * 1.25) = 12", got)
+	}
+	if got := (Estimator{}).Reserve(req); got != input {
+		t.Errorf("Reserve with no factor = %d, want Input = %d", got, input)
+	}
+}

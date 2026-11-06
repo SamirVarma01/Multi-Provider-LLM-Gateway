@@ -94,6 +94,51 @@ func (s *PGStore) ListKeys(ctx context.Context) ([]Key, error) {
 	return keys, nil
 }
 
+// KeyUpdate changes a key's limits. A Set flag applies its value, where nil
+// means unlimited; a field whose flag is false keeps its current value.
+type KeyUpdate struct {
+	SetRPMLimit bool
+	RPMLimit    *int
+	SetTPMLimit bool
+	TPMLimit    *int
+	SetBudget   bool
+	BudgetNUSD  *int64
+}
+
+// UpdateKey applies u in one transaction and returns the updated key. A
+// budget below what the key has already spent is allowed: its next
+// reservation is refused. New rate limits reach requests within the auth
+// cache's TTL; a new budget applies at once, because reservations read it
+// from the account row.
+func (s *PGStore) UpdateKey(ctx context.Context, id uuid.UUID, u KeyUpdate) (Key, error) {
+	var k Key
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			UPDATE api_keys
+			   SET rpm_limit = CASE WHEN $2::boolean THEN $3::integer ELSE rpm_limit END,
+			       tpm_limit = CASE WHEN $4::boolean THEN $5::integer ELSE tpm_limit END
+			 WHERE id = $1`, id, u.SetRPMLimit, u.RPMLimit, u.SetTPMLimit, u.TPMLimit); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE key_accounts
+			   SET budget_nusd = CASE WHEN $2::boolean THEN $3::bigint ELSE budget_nusd END, updated_at = now()
+			 WHERE key_id = $1`, id, u.SetBudget, u.BudgetNUSD); err != nil {
+			return err
+		}
+		var err error
+		k, err = scanKey(tx.QueryRow(ctx, selectKey+` WHERE k.id = $1`, id))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Key{}, ErrNotFound
+	}
+	if err != nil {
+		return Key{}, fmt.Errorf("auth: update: %w", err)
+	}
+	return k, nil
+}
+
 // RevokeKey revokes a key. Revoking an already revoked key is a no-op.
 func (s *PGStore) RevokeKey(ctx context.Context, id uuid.UUID) (Key, error) {
 	_, err := s.pool.Exec(ctx,

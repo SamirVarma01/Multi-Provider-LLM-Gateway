@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/SamirVarma01/llm-gateway/internal/auth"
 	"github.com/SamirVarma01/llm-gateway/internal/oai"
 	"github.com/SamirVarma01/llm-gateway/internal/obs"
 	"github.com/SamirVarma01/llm-gateway/internal/provider"
@@ -27,17 +28,21 @@ const (
 
 // apiError is a client-facing error.
 type apiError struct {
-	status int
-	typ    string
-	code   string
-	msg    string
+	status     int
+	typ        string
+	code       string
+	msg        string
+	retryAfter int // seconds; 0 sends no Retry-After
 }
 
 func badRequest(code, format string, args ...any) *apiError {
-	return &apiError{http.StatusBadRequest, oai.ErrTypeInvalidRequest, code, fmt.Sprintf(format, args...)}
+	return &apiError{status: http.StatusBadRequest, typ: oai.ErrTypeInvalidRequest, code: code, msg: fmt.Sprintf(format, args...)}
 }
 
 func (e *apiError) write(w http.ResponseWriter, r *http.Request) {
+	if e.retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.retryAfter))
+	}
 	oai.WriteError(w, r, e.status, e.typ, e.code, e.msg)
 }
 
@@ -48,8 +53,7 @@ const (
 	resultClientDisconnected = "client_disconnected"
 )
 
-// outcome is how one chat request ended. It is what settlement (Phase 4)
-// will charge from; today it is logged.
+// outcome is how one chat request ended, and what it is charged from.
 type outcome struct {
 	Provider      string
 	UpstreamModel string
@@ -60,6 +64,8 @@ type outcome struct {
 	Committed     bool // the first byte of the response reached the client
 	Billable      bool // design §10: charge Usage for this request
 	Usage         provider.Usage
+	Price         provider.Price // of the target that served the request
+	CostNUSD      int64
 	FinishReason  string
 	TTFT          time.Duration // the serving attempt's time to its first output chunk
 	Upstream      time.Duration // from the first upstream call to the last byte read
@@ -91,15 +97,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	model, err := s.opts.Router.Resolve(body.Model)
 	if err != nil {
-		(&apiError{http.StatusNotFound, oai.ErrTypeNotFound, "model_not_found",
-			fmt.Sprintf("The model %q does not exist.", body.Model)}).write(w, r)
+		(&apiError{status: http.StatusNotFound, typ: oai.ErrTypeNotFound, code: "model_not_found",
+			msg: fmt.Sprintf("The model %q does not exist.", body.Model)}).write(w, r)
 		return
 	}
+	estIn := s.opts.Estimator.Reserve(req)
 	plan, err := s.opts.Router.Plan(model, router.Request{
 		Chat:      req,
 		MaxTokens: body.OutputLimit(),
 		Policy:    r.Header.Get(headerRoutePolicy),
-		EstInput:  s.opts.Estimator.Input(req),
+		EstInput:  estIn,
 	})
 	var unsupported *router.UnsupportedError
 	switch {
@@ -115,6 +122,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key, _ := auth.FromContext(ctx)
+	adm, aerr := s.admit(ctx, key, plan, estIn)
+	if aerr != nil {
+		aerr.write(w, r)
+		return
+	}
+
 	c := &call{
 		alias:   body.Model,
 		id:      "chatcmpl-" + obs.RequestID(ctx),
@@ -127,7 +141,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out = s.serveComplete(ctx, w, r, c)
 	}
-	s.finish(r.Context(), out)
+	s.conclude(ctx, adm, out)
 }
 
 // serveComplete serves a non-streaming request. The response is written only
@@ -180,6 +194,7 @@ func (o *outcome) served(a *router.Attempt) {
 	o.UpstreamModel = a.Choice.Target.UpstreamModel
 	o.Attempts = a.N
 	o.TTFT = a.TTFT()
+	o.Price = a.Choice.Target.Price
 }
 
 func setRouteHeaders(w http.ResponseWriter, provider string, attempts int) {
@@ -210,7 +225,8 @@ func (s *Server) failPreCommit(w http.ResponseWriter, r *http.Request, out outco
 	return out
 }
 
-// finish logs the outcome. Settlement and metrics attach here in later phases.
+// finish logs a request once it is fully accounted for. Metrics attach here
+// in a later phase.
 func (s *Server) finish(ctx context.Context, out outcome) {
 	if s.onOutcome != nil {
 		s.onOutcome(out)
@@ -227,6 +243,7 @@ func (s *Server) finish(ctx context.Context, out outcome) {
 		"prompt_tokens", out.Usage.PromptTokens,
 		"completion_tokens", out.Usage.CompletionTokens,
 		"usage_estimated", out.Usage.Estimated,
+		"cost_nusd", out.CostNUSD,
 		"finish_reason", out.FinishReason,
 		"ttft", out.TTFT,
 		"upstream_duration", out.Upstream,
@@ -264,8 +281,8 @@ func (s *Server) decodeChatRequest(w http.ResponseWriter, r *http.Request) (*oai
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			return nil, &apiError{http.StatusRequestEntityTooLarge, oai.ErrTypeInvalidRequest, "request_too_large",
-				fmt.Sprintf("Request body exceeds %d bytes.", tooBig.Limit)}
+			return nil, &apiError{status: http.StatusRequestEntityTooLarge, typ: oai.ErrTypeInvalidRequest, code: "request_too_large",
+				msg: fmt.Sprintf("Request body exceeds %d bytes.", tooBig.Limit)}
 		}
 		return nil, badRequest("invalid_json", "Invalid JSON body: %v", err)
 	}

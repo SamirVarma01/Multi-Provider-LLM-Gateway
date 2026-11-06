@@ -240,11 +240,13 @@ func TestFastestPolicyUsesMeasuredTTFT(t *testing.T) {
 	setBehavior(t, e, "mock-a", mock.Behavior{ErrorRate: 1, ErrorStatus: 503})
 	readBody(t, e.chat(t, streamReq("pair", false)), true)
 	setBehavior(t, e, "mock-a", mock.Behavior{OutputTokens: 2, TTFTMs: 150})
-	if p, _ := routeHeaders(e.chat(t, streamReq("pair", false))); p != "mock-a" {
+	resp := e.chat(t, streamReq("pair", false))
+	readBody(t, resp, true) // a TTFT sample is recorded when the attempt ends
+	if p, _ := routeHeaders(resp); p != "mock-a" {
 		t.Fatalf("priority request served by %s", p)
 	}
 
-	resp := e.chat(t, streamReq("pair", false), fastest)
+	resp = e.chat(t, streamReq("pair", false), fastest)
 	readBody(t, resp, true)
 	if p, _ := routeHeaders(resp); p != "mock-b" {
 		t.Errorf("fastest served by %s, want mock-b (no added TTFT)", p)
