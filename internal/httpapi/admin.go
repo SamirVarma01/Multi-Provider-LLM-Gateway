@@ -64,6 +64,25 @@ func toKeyResponse(k auth.Key) keyResponse {
 	return out
 }
 
+func checkLimit(field string, v *int) *apiError {
+	if v != nil && *v <= 0 {
+		return badRequest("invalid_limit", "%s must be positive or null.", field)
+	}
+	return nil
+}
+
+// budgetNUSD validates a budget in USD and converts it. nil means unlimited.
+func budgetNUSD(usd *float64) (*int64, *apiError) {
+	if usd == nil {
+		return nil, nil
+	}
+	if b := *usd; math.IsNaN(b) || b < 0 || b > maxBudgetUSD {
+		return nil, badRequest("invalid_budget", "budget_usd must be between 0 and %g, or null.", float64(maxBudgetUSD))
+	}
+	nusd := int64(math.Round(*usd * 1e9))
+	return &nusd, nil
+}
+
 func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 	var req createKeyRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
@@ -78,21 +97,17 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for field, v := range map[string]*int{"rpm_limit": req.RPMLimit, "tpm_limit": req.TPMLimit} {
-		if v != nil && *v <= 0 {
-			badRequest("invalid_limit", "%s must be positive or null.", field).write(w, r)
+		if aerr := checkLimit(field, v); aerr != nil {
+			aerr.write(w, r)
 			return
 		}
 	}
-	nk := auth.NewKey{Name: req.Name, RPMLimit: req.RPMLimit, TPMLimit: req.TPMLimit}
-	if req.BudgetUSD != nil {
-		b := *req.BudgetUSD
-		if math.IsNaN(b) || b < 0 || b > maxBudgetUSD {
-			badRequest("invalid_budget", "budget_usd must be between 0 and %g, or null.", float64(maxBudgetUSD)).write(w, r)
-			return
-		}
-		nusd := int64(math.Round(b * 1e9))
-		nk.BudgetNUSD = &nusd
+	budget, aerr := budgetNUSD(req.BudgetUSD)
+	if aerr != nil {
+		aerr.write(w, r)
+		return
 	}
+	nk := auth.NewKey{Name: req.Name, RPMLimit: req.RPMLimit, TPMLimit: req.TPMLimit, BudgetNUSD: budget}
 
 	k, plaintext, err := s.opts.Keys.CreateKey(r.Context(), nk)
 	if err != nil {
@@ -118,6 +133,74 @@ func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		out[i] = toKeyResponse(k)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
+}
+
+// decodeKeyUpdate parses a PATCH body. A field that is absent stays as it is
+// and a field that is null becomes unlimited, which a plain struct decode
+// cannot tell apart, so it works from the raw fields.
+func decodeKeyUpdate(w http.ResponseWriter, r *http.Request) (auth.KeyUpdate, *apiError) {
+	var u auth.KeyUpdate
+	var fields map[string]json.RawMessage
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&fields); err != nil {
+		return u, badRequest("invalid_json", "Invalid JSON body: %v", err)
+	}
+	for name, raw := range fields {
+		var aerr *apiError
+		switch name {
+		case "rpm_limit":
+			u.SetRPMLimit = true
+			u.RPMLimit, aerr = decodeLimit(name, raw)
+		case "tpm_limit":
+			u.SetTPMLimit = true
+			u.TPMLimit, aerr = decodeLimit(name, raw)
+		case "budget_usd":
+			var usd *float64
+			if err := json.Unmarshal(raw, &usd); err != nil {
+				return u, badRequest("invalid_budget", "budget_usd must be a number or null.")
+			}
+			u.SetBudget = true
+			u.BudgetNUSD, aerr = budgetNUSD(usd)
+		default:
+			return u, badRequest("invalid_json", "Unknown field %q.", name)
+		}
+		if aerr != nil {
+			return u, aerr
+		}
+	}
+	return u, nil
+}
+
+func decodeLimit(field string, raw json.RawMessage) (*int, *apiError) {
+	var v *int
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, badRequest("invalid_limit", "%s must be a positive integer or null.", field)
+	}
+	return v, checkLimit(field, v)
+}
+
+func (s *Server) handleUpdateKey(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		badRequest("invalid_id", "Invalid key id.").write(w, r)
+		return
+	}
+	u, aerr := decodeKeyUpdate(w, r)
+	if aerr != nil {
+		aerr.write(w, r)
+		return
+	}
+	k, err := s.opts.Keys.UpdateKey(r.Context(), id, u)
+	switch {
+	case errors.Is(err, auth.ErrNotFound):
+		oai.WriteError(w, r, http.StatusNotFound, oai.ErrTypeNotFound, "key_not_found", "No such key.")
+		return
+	case err != nil:
+		obs.Logger(r.Context()).Error("update key failed", "err", err)
+		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Could not update key.")
+		return
+	}
+	obs.Logger(r.Context()).Info("api key updated", "key_id", k.ID.String())
+	writeJSON(w, http.StatusOK, toKeyResponse(k))
 }
 
 func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {

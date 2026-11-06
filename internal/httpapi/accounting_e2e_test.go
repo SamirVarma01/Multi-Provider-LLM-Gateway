@@ -272,3 +272,49 @@ func TestE2EPostgresDownFailsClosed(t *testing.T) {
 		t.Errorf("the provider was called with no reservation: %+v", recs)
 	}
 }
+
+func TestE2EUpdateKey(t *testing.T) {
+	e := newRealEnv(t, mock.Behavior{OutputTokens: 2}, nil)
+	budget, rpm := int64(5_000_000_000), 10 // $5
+	k, plaintext := e.newKey(t, auth.NewKey{RPMLimit: &rpm, BudgetNUSD: &budget})
+	url := e.admin.URL + "/admin/keys/" + k.ID.String()
+	patch := func(body string) *http.Response {
+		return e.do(t, http.MethodPatch, url, adminToken, body)
+	}
+
+	// A field left out stays; a field set changes.
+	got := decode[keyResponse](t, patch(`{"tpm_limit": 500}`))
+	if *got.RPMLimit != 10 || *got.TPMLimit != 500 || *got.BudgetUSD != 5 {
+		t.Errorf("after setting tpm_limit: %+v", got)
+	}
+	// null means unlimited.
+	got = decode[keyResponse](t, patch(`{"rpm_limit": null, "tpm_limit": null}`))
+	if got.RPMLimit != nil || got.TPMLimit != nil || *got.BudgetUSD != 5 {
+		t.Errorf("after clearing limits: %+v", got)
+	}
+	got = decode[keyResponse](t, patch(`{}`))
+	if *got.BudgetUSD != 5 {
+		t.Errorf("after an empty patch: %+v", got)
+	}
+
+	wantError(t, patch(`{"rpm_limit": 0}`), http.StatusBadRequest, "invalid_limit")
+	wantError(t, patch(`{"tpm_limit": "lots"}`), http.StatusBadRequest, "invalid_limit")
+	wantError(t, patch(`{"budget_usd": -1}`), http.StatusBadRequest, "invalid_budget")
+	wantError(t, patch(`{"budget_usd": "free"}`), http.StatusBadRequest, "invalid_budget")
+	wantError(t, patch(`{"name": "x"}`), http.StatusBadRequest, "invalid_json")
+	wantError(t, patch(`not json`), http.StatusBadRequest, "invalid_json")
+	wantError(t, e.do(t, http.MethodPatch, e.admin.URL+"/admin/keys/"+uuid.NewString(), adminToken, `{}`),
+		http.StatusNotFound, "key_not_found")
+	wantError(t, e.do(t, http.MethodPatch, e.admin.URL+"/admin/keys/nope", adminToken, `{}`),
+		http.StatusBadRequest, "invalid_id")
+
+	// A new budget applies at once, even with the key cached.
+	readBody(t, e.chatAs(t, plaintext, chatReq("chat", nil)), false)
+	e.outcome(t)
+	if got := decode[keyResponse](t, patch(`{"budget_usd": 0}`)); *got.BudgetUSD != 0 {
+		t.Errorf("budget = %v", *got.BudgetUSD)
+	}
+	wantError(t, e.chatAs(t, plaintext, chatReq("chat", nil)), http.StatusPaymentRequired, "insufficient_budget")
+	patch(`{"budget_usd": null}`)
+	readBody(t, e.chatAs(t, plaintext, chatReq("chat", nil)), false)
+}

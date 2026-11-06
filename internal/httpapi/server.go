@@ -22,6 +22,7 @@ import (
 type KeyAdmin interface {
 	CreateKey(ctx context.Context, nk auth.NewKey) (auth.Key, string, error)
 	ListKeys(ctx context.Context) ([]auth.Key, error)
+	UpdateKey(ctx context.Context, id uuid.UUID, u auth.KeyUpdate) (auth.Key, error)
 	RevokeKey(ctx context.Context, id uuid.UUID) (auth.Key, error)
 }
 
@@ -85,6 +86,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/keys", s.handleCreateKey)
 	mux.HandleFunc("GET /admin/keys", s.handleListKeys)
+	mux.HandleFunc("PATCH /admin/keys/{id}", s.handleUpdateKey)
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.handleRevokeKey)
 	mux.HandleFunc("/", notFound)
 	return obs.Middleware(s.opts.Logger)(adminAuth(s.opts.AdminToken)(mux))
