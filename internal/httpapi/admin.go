@@ -222,3 +222,17 @@ func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
 	obs.Logger(r.Context()).Info("api key revoked", "key_id", k.ID.String())
 	writeJSON(w, http.StatusOK, toKeyResponse(k))
 }
+
+// handleReconcile runs one reconciler pass now and reports what it resolved.
+func (s *Server) handleReconcile(w http.ResponseWriter, r *http.Request) {
+	res, err := s.opts.Reconciler.RunOnce(r.Context())
+	switch {
+	case err != nil:
+		obs.Logger(r.Context()).Error("reconcile failed", "err", err)
+		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Could not reconcile.")
+	case res.Skipped:
+		oai.WriteError(w, r, http.StatusConflict, oai.ErrTypeAPI, "reconcile_in_progress", "Another reconciler pass is running.")
+	default:
+		writeJSON(w, http.StatusOK, res)
+	}
+}

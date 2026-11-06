@@ -41,6 +41,7 @@ type Options struct {
 	Estimator      estimate.Estimator // sizes reservations; fills in usage providers do not report
 	Limiter        RateLimiter
 	Ledger         Ledger
+	Reconciler     Reconciler // runs passes on demand for POST /admin/reconcile
 	Ready          []ReadyCheck
 	AdminToken     string
 	RequestTimeout time.Duration
@@ -88,6 +89,7 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("GET /admin/keys", s.handleListKeys)
 	mux.HandleFunc("PATCH /admin/keys/{id}", s.handleUpdateKey)
 	mux.HandleFunc("POST /admin/keys/{id}/revoke", s.handleRevokeKey)
+	mux.HandleFunc("POST /admin/reconcile", s.handleReconcile)
 	mux.HandleFunc("/", notFound)
 	return obs.Middleware(s.opts.Logger)(adminAuth(s.opts.AdminToken)(mux))
 }

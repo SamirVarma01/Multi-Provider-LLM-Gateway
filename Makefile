@@ -1,4 +1,4 @@
-.PHONY: build test test-integration test-live vet up down logs smoke
+.PHONY: build test test-integration test-live vet up down logs smoke reconcile
 
 build:
 	go build ./...
@@ -31,3 +31,7 @@ logs:
 
 smoke:
 	./scripts/smoke.sh
+
+# One reconciler pass from outside the gateway, for when it is down.
+reconcile:
+	docker compose run --rm --build reconcile

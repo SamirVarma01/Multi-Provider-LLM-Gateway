@@ -39,6 +39,11 @@ type Ledger interface {
 	Release(ctx context.Context, requestID uuid.UUID, reason, source string) (bool, error)
 }
 
+// Reconciler runs a pass over orphaned reservations (design §9).
+type Reconciler interface {
+	RunOnce(ctx context.Context) (ledger.Result, error)
+}
+
 // admission is what a request took when it was let in, which closing it
 // settles up.
 type admission struct {

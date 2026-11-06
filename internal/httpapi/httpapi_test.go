@@ -67,6 +67,7 @@ var testRetry = router.RetryConfig{
 type envTweak struct {
 	router func(*router.Options)
 	server func(*Options)
+	mock   func(o *Options, mockURL string) // runs after server, with the mock's URL
 }
 
 // mockRoutes is the route table newEnv serves, with %[1]s the mock's URL.
@@ -115,6 +116,15 @@ func newEnvTweaked(t *testing.T, b mock.Behavior, tw envTweak) *testEnv {
 	m := mock.New(mock.Options{Defaults: b, Seed: 3})
 	mockTS := httptest.NewServer(m.Handler())
 	t.Cleanup(mockTS.Close)
+	if withMock := tw.mock; withMock != nil {
+		server := tw.server
+		tw.server = func(o *Options) {
+			if server != nil {
+				server(o)
+			}
+			withMock(o, mockTS.URL)
+		}
+	}
 	e := newEnvRoutesTweaked(t, fmt.Sprintf(mockRoutes, mockTS.URL), tw)
 	e.mock = m
 	return e

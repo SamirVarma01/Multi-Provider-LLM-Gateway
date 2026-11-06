@@ -447,3 +447,27 @@ func TestDrainStopsRetries(t *testing.T) {
 		t.Errorf("outcome = %+v", o)
 	}
 }
+
+type fakeReconciler struct {
+	res ledger.Result
+	err error
+}
+
+func (f fakeReconciler) RunOnce(context.Context) (ledger.Result, error) { return f.res, f.err }
+
+func TestAdminReconcileErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		r      fakeReconciler
+		status int
+		code   string
+	}{
+		{"another pass is running", fakeReconciler{res: ledger.Result{Skipped: true}}, http.StatusConflict, "reconcile_in_progress"},
+		{"failure", fakeReconciler{err: errors.New("postgres is down")}, http.StatusInternalServerError, "internal_error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newEnv(t, mock.Behavior{}, func(o *Options) { o.Reconciler = tt.r })
+			wantError(t, e.do(t, http.MethodPost, e.admin.URL+"/admin/reconcile", adminToken, nil), tt.status, tt.code)
+		})
+	}
+}
