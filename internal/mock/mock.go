@@ -15,6 +15,7 @@
 package mock
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -216,6 +217,29 @@ func (s *Server) ResetRecords() {
 	defer s.mu.Unlock()
 	s.records = nil
 	s.byRequest = make(map[string][]int)
+}
+
+// Restore loads records an earlier run wrote to its UsageLog, so a restart
+// does not forget what was billed: the reconciler reads a missing record as
+// "the call never happened". Call it before the server takes traffic. It
+// reports how many records it loaded and how many lines it skipped; a crash
+// can leave a partial last line.
+func (s *Server) Restore(r io.Reader) (restored, skipped int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		var rec Record
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			skipped++
+			continue
+		}
+		s.byRequest[rec.RequestID] = append(s.byRequest[rec.RequestID], len(s.records))
+		s.records = append(s.records, rec)
+		restored++
+	}
+	return restored, skipped, sc.Err()
 }
 
 func (s *Server) addRecord(r Record) {

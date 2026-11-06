@@ -69,12 +69,11 @@ services:
 
   # One reconciler pass, for when the gateway itself is down:
   #   docker compose run --rm --build reconcile
+  # It has no depends_on on purpose: compose would rebuild and recreate those
+  # services, and this runs after a crash, when nothing else should change.
   reconcile:
     profiles: [tools]
     build: { context: ., args: { CMD: reconcile } }
-    depends_on:
-      postgres: { condition: service_healthy }
-      mock: { condition: service_healthy }
     environment:
       DATABASE_URL: postgres://gateway:gateway@postgres:5432/gateway?sslmode=disable
       REDIS_URL: redis://redis:6379/0

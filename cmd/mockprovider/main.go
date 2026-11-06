@@ -10,7 +10,7 @@
 //	MOCK_ERROR_STATUS            default injected error status (default 500)
 //	MOCK_SEED                    output seed (default 1)
 //	MOCK_ALLOW_HEADER_OVERRIDES  honor X-Mock-* request headers (default true)
-//	MOCK_USAGE_FILE              append usage records as JSONL to this file (optional)
+//	MOCK_USAGE_FILE              keep usage records in this JSONL file across restarts (optional)
 //	LOG_LEVEL                    debug|info|warn|error (default info)
 package main
 
@@ -88,18 +88,32 @@ func run() error {
 
 	logger := obs.NewLogger(os.Stdout, level)
 	opts := mock.Options{Defaults: defaults, Seed: seed, AllowHeaderOverrides: allow, Logger: logger}
-	if path := os.Getenv("MOCK_USAGE_FILE"); path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	usagePath := os.Getenv("MOCK_USAGE_FILE")
+	if usagePath != "" {
+		f, err := os.OpenFile(usagePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			return err
 		}
 		defer f.Close()
 		opts.UsageLog = f
 	}
+	server := mock.New(opts)
+	if usagePath != "" {
+		f, err := os.Open(usagePath)
+		if err != nil {
+			return err
+		}
+		restored, skipped, err := server.Restore(f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("restore usage: %w", err)
+		}
+		logger.Info("restored usage records", "records", restored, "skipped_lines", skipped)
+	}
 
 	srv := &http.Server{
 		Addr:              env("MOCK_ADDR", ":9000"),
-		Handler:           mock.New(opts).Handler(),
+		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

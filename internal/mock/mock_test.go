@@ -410,3 +410,40 @@ func TestUsageEndpoints(t *testing.T) {
 		t.Errorf("records after reset = %d", n)
 	}
 }
+
+func TestRestoreKeepsRecordsAcrossRestarts(t *testing.T) {
+	var log bytes.Buffer
+	first := New(Options{Defaults: Behavior{OutputTokens: 3}, Seed: 1, UsageLog: &log})
+	ts := httptest.NewServer(first.Handler())
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/p/a/v1/chat/completions",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set(RequestIDHeader, "req-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	want := first.Records("req-1")
+	if len(want) != 1 || !want[0].Billable {
+		t.Fatalf("records = %+v", want)
+	}
+
+	// A crash can leave a partial last line.
+	saved := log.String() + `{"request_id":"req-2","att`
+	var after bytes.Buffer
+	second := New(Options{Defaults: Behavior{OutputTokens: 3}, Seed: 1, UsageLog: &after})
+	restored, skipped, err := second.Restore(strings.NewReader(saved))
+	if err != nil || restored != 1 || skipped != 1 {
+		t.Fatalf("Restore = %d, %d, %v", restored, skipped, err)
+	}
+	got := second.Records("req-1")
+	if len(got) != 1 || got[0].Billable != want[0].Billable || got[0].CompletionTokens != want[0].CompletionTokens ||
+		got[0].PromptTokens != want[0].PromptTokens || got[0].Provider != "a" {
+		t.Errorf("restored = %+v, want %+v", got, want)
+	}
+	if after.Len() != 0 {
+		t.Errorf("Restore rewrote %d bytes to the log", after.Len())
+	}
+}
