@@ -62,7 +62,7 @@ func (s *Server) serveStream(ctx context.Context, cancel context.CancelFunc,
 	h.Set("X-Accel-Buffering", "no") // ask reverse proxies not to buffer
 	setRouteHeaders(w, out.Provider, out.Attempts)
 	w.WriteHeader(http.StatusOK)
-	out.Committed, out.Billable = true, true
+	out.Status, out.Committed, out.Billable = http.StatusOK, true, true
 	enc := &chunkEncoder{sw: sse.NewWriter(w), id: c.id, created: c.created, model: c.alias}
 
 	var acc provider.Accumulator

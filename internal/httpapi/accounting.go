@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -90,11 +91,14 @@ func (s *Server) admit(ctx context.Context, key auth.Key, plan *router.Plan, est
 	case err != nil:
 		// Fail open: budgets are in Postgres, so only rate fairness is lost.
 		log.Warn("rate limiter unavailable; admitting without a limit", "err", err)
+		s.opts.Metrics.RateLimitError()
 	case dec.TooLarge:
+		s.opts.Metrics.RateLimited(key.ID.String(), "tokens_exceed_limit")
 		return nil, &apiError{status: http.StatusTooManyRequests, typ: oai.ErrTypeRateLimit, code: "tokens_exceed_limit",
 			msg: fmt.Sprintf("This request needs up to %d tokens, more than this key's tokens-per-minute limit. Lower max_tokens.", tokens)}
 	case !dec.Allowed:
 		wait := max(1, int(math.Ceil(dec.RetryAfter.Seconds())))
+		s.opts.Metrics.RateLimited(key.ID.String(), "rate_limit_exceeded")
 		return nil, &apiError{status: http.StatusTooManyRequests, typ: oai.ErrTypeRateLimit, code: "rate_limit_exceeded",
 			msg: fmt.Sprintf("Rate limit exceeded. Try again in %d seconds.", wait), retryAfter: wait}
 	default:
@@ -107,29 +111,62 @@ func (s *Server) admit(ctx context.Context, key auth.Key, plan *router.Plan, est
 		RequestID: id, KeyID: adm.keyID, AmountNUSD: adm.reservedNUSD, Alias: plan.Model.Alias, Meta: meta,
 	})
 	if err == nil {
+		s.opts.Metrics.Reservation("reserved")
 		return adm, nil
 	}
 	s.background(ctx, func(ctx context.Context) { s.adjustTokens(ctx, adm, adm.tokens) })
 	if errors.Is(err, ledger.ErrInsufficientBudget) {
+		s.opts.Metrics.Reservation("insufficient_budget")
 		return nil, &apiError{status: http.StatusPaymentRequired, typ: oai.ErrTypeBudget, code: "insufficient_budget",
 			msg: fmt.Sprintf("This key's remaining budget cannot cover this request, which could cost up to $%.6f.",
 				float64(adm.reservedNUSD)/1e9)}
 	}
 	// Fail closed: without a reservation the request could overspend.
 	log.Error("reserve failed", "err", err)
+	s.opts.Metrics.Reservation("error")
 	return nil, &apiError{status: http.StatusServiceUnavailable, typ: oai.ErrTypeAPI, code: "ledger_unavailable",
 		msg: "The gateway cannot record usage right now, so it is not accepting requests."}
 }
 
-// conclude closes a finished request in the background. Nothing the client
-// is waiting for depends on it, and running it in the handler would keep the
-// response open: a stream's terminating chunk, and the connection's next
-// request, would wait for Postgres, for as long as settlement retries.
-func (s *Server) conclude(ctx context.Context, adm *admission, out outcome) {
+// conclude records a finished request and closes it in the background.
+// Nothing the client is waiting for depends on the close, and running it in
+// the handler would keep the response open: a stream's terminating chunk, and
+// the connection's next request, would wait for Postgres, for as long as
+// settlement retries.
+func (s *Server) conclude(ctx context.Context, adm *admission, plan *router.Plan, out outcome) {
+	if out.Billable {
+		out.CostNUSD = ledger.Cost(out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Price)
+	}
+	s.observe(ctx, adm, plan, &out)
 	s.background(ctx, func(ctx context.Context) {
 		s.account(ctx, adm, &out)
 		s.finish(ctx, out)
 	})
+}
+
+// observe updates the metrics for a request that passed admission. It runs
+// before the close, so they do not lag behind Postgres.
+func (s *Server) observe(ctx context.Context, adm *admission, plan *router.Plan, out *outcome) {
+	m := s.opts.Metrics
+	key, model := adm.keyID.String(), plan.Model.Alias
+	providerLabel := cmp.Or(out.Provider, obs.NoProvider)
+	m.Request(key, model, providerLabel, out.Status, out.Result)
+
+	failed := out.Attempts
+	if out.Committed {
+		failed--
+	}
+	m.FailedAttempts(model, failed)
+	if out.Attempts > 0 {
+		out.Overhead = s.now().Sub(obs.RequestStart(ctx)) - plan.UpstreamWait
+		m.Overhead(out.Overhead, out.Stream)
+	}
+	if out.TTFT > 0 {
+		m.TTFT(out.TTFT, model, providerLabel)
+	}
+	if out.Billable {
+		m.Usage(key, model, providerLabel, out.Usage.PromptTokens, out.Usage.CompletionTokens, float64(out.CostNUSD)/1e9)
+	}
 }
 
 // account returns unused tokens to the bucket and closes the request in the
@@ -141,21 +178,23 @@ func (s *Server) account(ctx context.Context, adm *admission, out *outcome) {
 	used := 0
 	if out.Billable {
 		used = out.Usage.PromptTokens + out.Usage.CompletionTokens
-		out.CostNUSD = ledger.Cost(out.Usage.PromptTokens, out.Usage.CompletionTokens, out.Price)
 	}
 	if adm.tokens > 0 {
 		s.adjustTokens(ctx, adm, adm.tokens-used)
 	}
 
+	result, reason := "released", releaseReason(*out)
+	if out.Billable {
+		result, reason = "settled", ledger.ReasonInterrupted
+		if out.Result == resultCompleted {
+			reason = ledger.ReasonCompleted
+		}
+	}
 	var closed bool
 	err := s.retryClose(ctx, func(ctx context.Context) (err error) {
 		if !out.Billable {
-			closed, err = s.opts.Ledger.Release(ctx, adm.requestID, releaseReason(*out), ledger.SourceGateway)
+			closed, err = s.opts.Ledger.Release(ctx, adm.requestID, reason, ledger.SourceGateway)
 			return err
-		}
-		reason := ledger.ReasonInterrupted
-		if out.Result == resultCompleted {
-			reason = ledger.ReasonCompleted
 		}
 		closed, err = s.opts.Ledger.Settle(ctx, ledger.Settlement{
 			RequestID: adm.requestID, AmountNUSD: out.CostNUSD, Provider: out.Provider, UpstreamModel: out.UpstreamModel,
@@ -167,10 +206,13 @@ func (s *Server) account(ctx context.Context, adm *admission, out *outcome) {
 	log := obs.Logger(ctx)
 	switch {
 	case err != nil:
+		result = "failed"
 		log.Error("could not close the request; leaving it to the reconciler", "err", err)
 	case !closed:
+		result = "already_closed"
 		log.Warn("request was already closed")
 	}
+	s.opts.Metrics.ReservationClosed(result, reason)
 }
 
 func releaseReason(out outcome) string {

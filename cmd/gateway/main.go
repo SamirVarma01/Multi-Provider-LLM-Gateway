@@ -56,7 +56,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	rt, err := router.New(routes, providers, routerOptions(cfg, logger))
+	metrics := obs.NewMetrics()
+	rt, err := router.New(routes, providers, routerOptions(cfg, logger, metrics))
 	if err != nil {
 		return err
 	}
@@ -86,6 +87,7 @@ func run() error {
 	led := ledger.New(pool)
 	usage := ledger.UsageSources(routes.Providers, &http.Client{Timeout: 5 * time.Second})
 	reconciler := ledger.NewReconciler(led, usage, cfg.RequestTimeout+cfg.ReconcileGrace, logger)
+	reconciler.OnPass = func(res ledger.Result, err error) { recordPass(metrics, res, err) }
 	api := httpapi.New(httpapi.Options{
 		Logger:     logger,
 		Auth:       auth.NewCache(keys, cfg.AuthCacheTTL),
@@ -100,6 +102,7 @@ func run() error {
 			{Name: "postgres", Check: pool.Ping},
 			{Name: "redis", Check: func(ctx context.Context) error { return rdb.Ping(ctx).Err() }},
 		},
+		Metrics:        metrics,
 		AdminToken:     cfg.AdminToken,
 		RequestTimeout: cfg.RequestTimeout,
 		LedgerTimeout:  cfg.LedgerTimeout,
@@ -107,6 +110,9 @@ func run() error {
 	})
 
 	servers := []*http.Server{newServer(cfg.PublicAddr, api.PublicHandler())}
+	if cfg.MetricsAddr != "" {
+		servers = append(servers, newServer(cfg.MetricsAddr, metricsMux(metrics)))
+	}
 	if cfg.AdminToken != "" {
 		servers = append(servers, newServer(cfg.AdminAddr, api.AdminHandler()))
 	} else {
@@ -146,8 +152,34 @@ func run() error {
 	return err
 }
 
-func routerOptions(cfg config.Config, logger *slog.Logger) router.Options {
+func recordPass(m *obs.Metrics, res ledger.Result, err error) {
+	switch {
+	case err != nil:
+		m.ReconcilePass("error")
+	case res.Skipped:
+		m.ReconcilePass("skipped")
+	default:
+		m.ReconcilePass("ok")
+	}
+	m.ReconcileOrphans("settled", res.Settled)
+	m.ReconcileOrphans("released_no_call", res.ReleasedNoCall)
+	m.ReconcileOrphans("released_unknown_usage", res.ReleasedUnknownUsage)
+	m.ReconcileOrphans("already_closed", res.AlreadyClosed)
+	m.ReconcileOrphans("failed", res.Failed)
+}
+
+// metricsMux serves /metrics, and nothing else, on the metrics listener.
+func metricsMux(m *obs.Metrics) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	return mux
+}
+
+func routerOptions(cfg config.Config, logger *slog.Logger, metrics *obs.Metrics) router.Options {
 	return router.Options{
+		OnBreakerChange: func(provider, model string, from, to router.BreakerState) {
+			metrics.BreakerChanged(provider, model, from.String(), to.String())
+		},
 		Breaker: router.BreakerConfig{
 			WindowSize:          cfg.BreakerWindowSize,
 			Window:              cfg.BreakerWindow,

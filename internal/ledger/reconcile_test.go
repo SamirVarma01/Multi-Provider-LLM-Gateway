@@ -323,3 +323,21 @@ func TestReconcileAgainstTheMock(t *testing.T) {
 		t.Errorf("reason = %s", reason)
 	}
 }
+
+func TestReconcilerReportsEveryPass(t *testing.T) {
+	f := newFixture(t, nil)
+	f.orphan(t, 400, cheap)
+	r := f.reconciler(map[string]UsageSource{"cheap": &stubUsage{}})
+	var got []Result
+	r.OnPass = func(res Result, err error) {
+		if err != nil {
+			t.Error(err)
+		}
+		got = append(got, res)
+	}
+	pass(t, r)
+	pass(t, r)
+	if len(got) != 2 || got[0].ReleasedNoCall != 1 || got[1].Orphans != 0 {
+		t.Errorf("reports = %+v", got)
+	}
+}

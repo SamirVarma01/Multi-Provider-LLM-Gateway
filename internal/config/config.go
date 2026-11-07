@@ -17,6 +17,10 @@ type Config struct {
 	AdminAddr  string // GATEWAY_ADMIN_ADDR
 	AdminToken string // ADMIN_TOKEN; empty disables the admin listener
 
+	// MetricsAddr is METRICS_ADDR, where /metrics is served; empty disables
+	// it. It is a listener of its own because the metrics carry per-key spend.
+	MetricsAddr string
+
 	DatabaseURL    string // DATABASE_URL
 	RedisURL       string // REDIS_URL
 	RoutesFile     string // ROUTES_FILE
@@ -75,6 +79,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		PublicAddr:           r.str("GATEWAY_PUBLIC_ADDR", ":8080"),
 		AdminAddr:            r.str("GATEWAY_ADMIN_ADDR", ":8081"),
 		AdminToken:           r.str("ADMIN_TOKEN", ""),
+		MetricsAddr:          r.str("METRICS_ADDR", ":9090"),
 		DatabaseURL:          r.required("DATABASE_URL"),
 		RedisURL:             r.required("REDIS_URL"),
 		RoutesFile:           r.required("ROUTES_FILE"),

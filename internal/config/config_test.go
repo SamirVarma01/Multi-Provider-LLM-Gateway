@@ -23,8 +23,8 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.PublicAddr != ":8080" || cfg.AdminAddr != ":8081" {
-		t.Errorf("addrs = %q, %q", cfg.PublicAddr, cfg.AdminAddr)
+	if cfg.PublicAddr != ":8080" || cfg.AdminAddr != ":8081" || cfg.MetricsAddr != ":9090" {
+		t.Errorf("addrs = %q, %q, %q", cfg.PublicAddr, cfg.AdminAddr, cfg.MetricsAddr)
 	}
 	if cfg.AuthCacheTTL != 10*time.Second || cfg.RequestTimeout != 10*time.Minute {
 		t.Errorf("durations = %v, %v", cfg.AuthCacheTTL, cfg.RequestTimeout)

@@ -84,7 +84,10 @@ func (r *Router) Execute(ctx context.Context, p *Plan, commit func(*Attempt) err
 			if n >= cfg.MaxAttempts || !r.timeForAnother(ctx) {
 				return stop()
 			}
-			if err := r.backoff(ctx, pass); err != nil {
+			waited := r.opts.Now()
+			err := r.backoff(ctx, pass)
+			p.UpstreamWait += r.opts.Now().Sub(waited)
+			if err != nil {
 				return stop()
 			}
 		}
@@ -181,11 +184,13 @@ func (r *Router) attempt(ctx context.Context, p *Plan, c Choice, n int, tk *tick
 		ttft:     r.opts.Retry.TTFTTimeout,
 		idle:     r.opts.Retry.IdleTimeout,
 		now:      r.opts.Now,
+		waited:   &p.UpstreamWait,
 	}
 	a := &Attempt{N: n, Choice: c, r: r, model: p.Model, parent: ctx, ticket: tk, ts: ts, start: r.opts.Now()}
 	ts.timer = time.AfterFunc(ts.ttft, ts.stall)
 
 	st, err := c.Provider.Stream(actx, c.Target, c.Req)
+	p.UpstreamWait += r.opts.Now().Sub(a.start)
 	if err != nil {
 		err = ts.classify(err)
 		a.Failed(err)
@@ -299,6 +304,7 @@ type timedStream struct {
 	ttft     time.Duration
 	idle     time.Duration
 	now      func() time.Time
+	waited   *time.Duration // the plan's UpstreamWait
 
 	gotOutput   atomic.Bool // read by the timer goroutine
 	firstOutput time.Time
@@ -315,12 +321,14 @@ func (s *timedStream) stall() {
 }
 
 func (s *timedStream) Recv() (*provider.Chunk, error) {
+	start := s.now()
 	c, err := s.inner.Recv()
+	now := s.now()
+	*s.waited += now.Sub(start)
 	if err != nil {
 		return nil, s.classify(err)
 	}
 	if c.HasOutput() {
-		now := s.now()
 		if !s.gotOutput.Load() {
 			s.firstOutput = now
 			s.gotOutput.Store(true)

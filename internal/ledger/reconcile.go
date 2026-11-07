@@ -126,6 +126,9 @@ type Result struct {
 // Reconciler closes reservations the gateway never closed, because it
 // crashed or could not reach Postgres (design §9).
 type Reconciler struct {
+	// OnPass, if set, sees the result of every pass. Set it before Run.
+	OnPass func(Result, error)
+
 	ledger  *Ledger
 	sources map[string]UsageSource // by provider name
 	after   time.Duration
@@ -160,7 +163,15 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) {
 // reconciler is running, it does nothing and reports Skipped. An orphan that
 // cannot be resolved stays open for the next pass, so an unreachable usage
 // source delays a close and never guesses at one.
-func (r *Reconciler) RunOnce(ctx context.Context) (res Result, err error) {
+func (r *Reconciler) RunOnce(ctx context.Context) (Result, error) {
+	res, err := r.pass(ctx)
+	if r.OnPass != nil {
+		r.OnPass(res, err)
+	}
+	return res, err
+}
+
+func (r *Reconciler) pass(ctx context.Context) (res Result, err error) {
 	conn, err := r.ledger.pool.Acquire(ctx)
 	if err != nil {
 		return res, fmt.Errorf("ledger: reconcile: %w", err)
