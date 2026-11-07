@@ -99,3 +99,17 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		}
 	}
 }
+
+// A TTFT timeout at or above the request timeout turns failover off without
+// any other sign, so it must not start.
+func TestLoadRejectsConfigThatDisablesFailover(t *testing.T) {
+	_, err := Load(env(map[string]string{
+		"DATABASE_URL":    "postgres://x",
+		"REDIS_URL":       "redis://x",
+		"ROUTES_FILE":     "routes.yaml",
+		"REQUEST_TIMEOUT": "10s",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "failover never happens") {
+		t.Errorf("err = %v", err)
+	}
+}

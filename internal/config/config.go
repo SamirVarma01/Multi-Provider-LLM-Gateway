@@ -137,6 +137,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	check(cfg.MaxAttempts >= 1, "MAX_ATTEMPTS must be at least 1")
 	check(cfg.AttemptTTFTTimeout > 0, "ATTEMPT_TTFT_TIMEOUT must be positive")
+	// Failover stops once less than the TTFT timeout is left before the request
+	// deadline, so at or above REQUEST_TIMEOUT it would never happen.
+	check(cfg.AttemptTTFTTimeout < cfg.RequestTimeout, "ATTEMPT_TTFT_TIMEOUT must be below REQUEST_TIMEOUT, or failover never happens")
 	check(cfg.StreamIdleTimeout > 0, "STREAM_IDLE_TIMEOUT must be positive")
 	check(cfg.RetryBackoffBase > 0, "RETRY_BACKOFF_BASE must be positive")
 	check(cfg.RetryBackoffMax >= cfg.RetryBackoffBase, "RETRY_BACKOFF_MAX must be >= RETRY_BACKOFF_BASE")
