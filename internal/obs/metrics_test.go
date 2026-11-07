@@ -48,6 +48,23 @@ func TestMetricsExposition(t *testing.T) {
 	}
 }
 
+// A rare event must be visible to rate and increase the first time it
+// happens, which needs its series to exist at 0 beforehand.
+func TestRareEventsStartAtZero(t *testing.T) {
+	out := scrape(t, NewMetrics())
+	for _, want := range []string{
+		`gateway_reconciler_orphans_total{action="released_unknown_usage"} 0`,
+		`gateway_reconciler_orphans_total{action="failed"} 0`,
+		`gateway_reservation_closes_total{reason="completed",result="failed"} 0`,
+		`gateway_reservations_total{result="error"} 0`,
+		`gateway_ratelimit_rejections_total{code="rate_limit_exceeded"} 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exposition lacks %s", want)
+		}
+	}
+}
+
 func TestBreakerMetrics(t *testing.T) {
 	m := NewMetrics()
 	m.BreakerChanged("p", "m", "closed", "closed") // initial report

@@ -26,7 +26,7 @@ const (
 var overheadBuckets = []float64{.0001, .00025, .0005, .001, .0025, .005, .01, .025, .05, .1, .25, .5, 1}
 
 // ttftBuckets span fast mocks to slow models: 10ms to 30s.
-var ttftBuckets = []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
+var ttftBuckets = []float64{.01, .025, .05, .075, .1, .15, .25, .5, .75, 1, 2.5, 5, 10, 30}
 
 // Metrics holds the gateway's Prometheus metrics (design §4). Every label
 // value is bounded by the route table, the set of API keys, or a constant;
@@ -102,7 +102,8 @@ func NewMetrics() *Metrics {
 	m.breakerChanges = counter("gateway_breaker_transitions_total", "Circuit breaker state changes, by the state entered.",
 		"provider", "upstream_model", "to")
 
-	m.rateLimited = counter("gateway_ratelimit_rejections_total", "Requests refused by rate limits, by error code.", "key", "code")
+	m.rateLimited = counter("gateway_ratelimit_rejections_total",
+		"Requests refused by rate limits, by error code. gateway_requests_total has them by key.", "code")
 	m.rateLimitErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "gateway_ratelimit_errors_total", Help: "Requests admitted without a limit because Redis failed.",
 	})
@@ -120,7 +121,37 @@ func NewMetrics() *Metrics {
 	m.reconcileOrphans = counter("gateway_reconciler_orphans_total",
 		"Orphans the reconciler handled, by action (settled, released_no_call, released_unknown_usage, already_closed, failed). released_unknown_usage is an undercharge.",
 		"action")
+	m.startAtZero()
 	return m
+}
+
+// startAtZero creates the series whose labels are known in advance. A counter
+// that first appears at 1 has no earlier sample, so rate and increase cannot
+// see that increment, and these are the rare events a dashboard must show.
+// Series carrying a key cannot be listed in advance, so they lose theirs.
+func (m *Metrics) startAtZero() {
+	for _, code := range []string{"rate_limit_exceeded", "tokens_exceed_limit"} {
+		m.rateLimited.WithLabelValues(code)
+	}
+	for _, result := range []string{"reserved", "insufficient_budget", "error"} {
+		m.reservations.WithLabelValues(result)
+	}
+	for result, reasons := range map[string][]string{
+		"settled":        {"completed", "interrupted"},
+		"released":       {"failed", "rejected", "cancelled"},
+		"already_closed": {"completed", "interrupted", "failed", "rejected", "cancelled"},
+		"failed":         {"completed", "interrupted", "failed", "rejected", "cancelled"},
+	} {
+		for _, reason := range reasons {
+			m.closes.WithLabelValues(result, reason)
+		}
+	}
+	for _, result := range []string{"ok", "skipped", "error"} {
+		m.reconcilePasses.WithLabelValues(result)
+	}
+	for _, action := range []string{"settled", "released_no_call", "released_unknown_usage", "already_closed", "failed"} {
+		m.reconcileOrphans.WithLabelValues(action)
+	}
 }
 
 // Handler serves the metrics in Prometheus format.
@@ -183,7 +214,7 @@ func (m *Metrics) BreakerChanged(provider, model, from, to string) {
 }
 
 // RateLimited counts a request refused by a rate limit.
-func (m *Metrics) RateLimited(key, code string) { m.rateLimited.WithLabelValues(key, code).Inc() }
+func (m *Metrics) RateLimited(code string) { m.rateLimited.WithLabelValues(code).Inc() }
 
 // RateLimitError counts a request admitted because Redis failed.
 func (m *Metrics) RateLimitError() { m.rateLimitErrors.Inc() }

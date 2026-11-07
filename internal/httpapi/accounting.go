@@ -93,12 +93,12 @@ func (s *Server) admit(ctx context.Context, key auth.Key, plan *router.Plan, est
 		log.Warn("rate limiter unavailable; admitting without a limit", "err", err)
 		s.opts.Metrics.RateLimitError()
 	case dec.TooLarge:
-		s.opts.Metrics.RateLimited(key.ID.String(), "tokens_exceed_limit")
+		s.opts.Metrics.RateLimited("tokens_exceed_limit")
 		return nil, &apiError{status: http.StatusTooManyRequests, typ: oai.ErrTypeRateLimit, code: "tokens_exceed_limit",
 			msg: fmt.Sprintf("This request needs up to %d tokens, more than this key's tokens-per-minute limit. Lower max_tokens.", tokens)}
 	case !dec.Allowed:
 		wait := max(1, int(math.Ceil(dec.RetryAfter.Seconds())))
-		s.opts.Metrics.RateLimited(key.ID.String(), "rate_limit_exceeded")
+		s.opts.Metrics.RateLimited("rate_limit_exceeded")
 		return nil, &apiError{status: http.StatusTooManyRequests, typ: oai.ErrTypeRateLimit, code: "rate_limit_exceeded",
 			msg: fmt.Sprintf("Rate limit exceeded. Try again in %d seconds.", wait), retryAfter: wait}
 	default:
