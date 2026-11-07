@@ -17,6 +17,10 @@ type Config struct {
 	AdminAddr  string // GATEWAY_ADMIN_ADDR
 	AdminToken string // ADMIN_TOKEN; empty disables the admin listener
 
+	// MetricsAddr is METRICS_ADDR, where /metrics is served; empty disables
+	// it. It is a listener of its own because the metrics carry per-key spend.
+	MetricsAddr string
+
 	DatabaseURL    string // DATABASE_URL
 	RedisURL       string // REDIS_URL
 	RoutesFile     string // ROUTES_FILE
@@ -75,6 +79,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		PublicAddr:           r.str("GATEWAY_PUBLIC_ADDR", ":8080"),
 		AdminAddr:            r.str("GATEWAY_ADMIN_ADDR", ":8081"),
 		AdminToken:           r.str("ADMIN_TOKEN", ""),
+		MetricsAddr:          r.str("METRICS_ADDR", ":9090"),
 		DatabaseURL:          r.required("DATABASE_URL"),
 		RedisURL:             r.required("REDIS_URL"),
 		RoutesFile:           r.required("ROUTES_FILE"),
@@ -132,6 +137,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 
 	check(cfg.MaxAttempts >= 1, "MAX_ATTEMPTS must be at least 1")
 	check(cfg.AttemptTTFTTimeout > 0, "ATTEMPT_TTFT_TIMEOUT must be positive")
+	// Failover stops once less than the TTFT timeout is left before the request
+	// deadline, so at or above REQUEST_TIMEOUT it would never happen.
+	check(cfg.AttemptTTFTTimeout < cfg.RequestTimeout, "ATTEMPT_TTFT_TIMEOUT must be below REQUEST_TIMEOUT, or failover never happens")
 	check(cfg.StreamIdleTimeout > 0, "STREAM_IDLE_TIMEOUT must be positive")
 	check(cfg.RetryBackoffBase > 0, "RETRY_BACKOFF_BASE must be positive")
 	check(cfg.RetryBackoffMax >= cfg.RetryBackoffBase, "RETRY_BACKOFF_MAX must be >= RETRY_BACKOFF_BASE")

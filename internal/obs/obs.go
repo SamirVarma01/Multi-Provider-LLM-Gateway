@@ -1,4 +1,5 @@
-// Package obs holds logging and request-ID plumbing shared by all HTTP services.
+// Package obs holds logging, request-ID plumbing, and metrics shared by the
+// HTTP services.
 package obs
 
 import (
@@ -20,6 +21,7 @@ type ctxKey int
 const (
 	requestIDKey ctxKey = iota
 	loggerKey
+	startKey
 )
 
 // NewLogger returns a JSON slog logger writing to w.
@@ -36,6 +38,12 @@ func WithRequestID(ctx context.Context, id string) context.Context {
 func RequestID(ctx context.Context) string {
 	id, _ := ctx.Value(requestIDKey).(string)
 	return id
+}
+
+// RequestStart returns when Middleware received the request, or the zero time.
+func RequestStart(ctx context.Context) time.Time {
+	t, _ := ctx.Value(startKey).(time.Time)
+	return t
 }
 
 // WithLogger returns ctx carrying l.
@@ -64,7 +72,7 @@ func Middleware(base *slog.Logger) func(http.Handler) http.Handler {
 			if cid := r.Header.Get(RequestIDHeader); cid != "" {
 				l = l.With("client_request_id", cid)
 			}
-			ctx := WithLogger(WithRequestID(r.Context(), id), l)
+			ctx := context.WithValue(WithLogger(WithRequestID(r.Context(), id), l), startKey, start)
 			w.Header().Set(RequestIDHeader, id)
 
 			rec := &statusRecorder{ResponseWriter: w}

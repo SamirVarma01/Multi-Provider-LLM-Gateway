@@ -32,6 +32,11 @@ type Plan struct {
 	Policy   string
 	Choices  []Choice
 	Explored bool // a non-best target was put first to refresh its latency estimates
+
+	// UpstreamWait adds up the time spent waiting on upstreams, across all
+	// attempts, including backoff between them. Total latency minus this is
+	// the gateway's own time. It is only touched by the request's goroutine.
+	UpstreamWait time.Duration
 }
 
 // UnsupportedError means no candidate of an alias can serve a request.

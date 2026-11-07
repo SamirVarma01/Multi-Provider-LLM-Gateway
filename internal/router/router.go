@@ -61,6 +61,9 @@ type Options struct {
 	Now         func() time.Time // clock; nil = time.Now
 	Rand        func() float64   // uniform in [0, 1); nil = math/rand/v2
 	Logger      *slog.Logger     // breaker state changes; nil = slog.Default()
+	// OnBreakerChange, if set, sees every target's initial state (from equal
+	// to to) and then each change.
+	OnBreakerChange func(provider, model string, from, to BreakerState)
 }
 
 // Router holds the route table and the health of every target. The route
@@ -173,6 +176,9 @@ type targetKey struct{ provider, model string }
 
 func (r *Router) newHealth(t targetKey) *targetHealth {
 	log := r.opts.Logger.With("provider", t.provider, "upstream_model", t.model)
+	if r.opts.OnBreakerChange != nil {
+		r.opts.OnBreakerChange(t.provider, t.model, StateClosed, StateClosed)
+	}
 	return &targetHealth{
 		breaker: newBreaker(r.opts.Breaker, r.opts.Now, func(from, to BreakerState) {
 			level := slog.LevelInfo
@@ -180,6 +186,9 @@ func (r *Router) newHealth(t targetKey) *targetHealth {
 				level = slog.LevelWarn
 			}
 			log.Log(context.Background(), level, "circuit breaker state change", "from", from.String(), "to", to.String())
+			if r.opts.OnBreakerChange != nil {
+				r.opts.OnBreakerChange(t.provider, t.model, from, to)
+			}
 		}),
 		latency: &latency{cfg: r.opts.Latency},
 	}

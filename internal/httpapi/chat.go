@@ -46,6 +46,10 @@ func (e *apiError) write(w http.ResponseWriter, r *http.Request) {
 	oai.WriteError(w, r, e.status, e.typ, e.code, e.msg)
 }
 
+// statusClientClosed records a client that left before any response, which
+// has no HTTP status of its own. The value is nginx's convention.
+const statusClientClosed = 499
+
 // Request results recorded in an outcome.
 const (
 	resultCompleted          = "completed"
@@ -60,6 +64,7 @@ type outcome struct {
 	Policy        string
 	Attempts      int // upstream attempts made, including failed ones
 	Stream        bool
+	Status        int // HTTP status; 200 for a stream that failed after it committed
 	Result        string
 	Committed     bool // the first byte of the response reached the client
 	Billable      bool // design §10: charge Usage for this request
@@ -69,6 +74,7 @@ type outcome struct {
 	FinishReason  string
 	TTFT          time.Duration // the serving attempt's time to its first output chunk
 	Upstream      time.Duration // from the first upstream call to the last byte read
+	Overhead      time.Duration // total latency minus time spent waiting on upstreams
 	Err           error
 }
 
@@ -81,24 +87,31 @@ type call struct {
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	defer s.opts.Metrics.RequestStarted()()
 	ctx, cancel := context.WithTimeout(r.Context(), s.opts.RequestTimeout)
 	defer cancel()
 
+	key, _ := auth.FromContext(ctx)
+	refuse := func(model string, e *apiError) {
+		s.opts.Metrics.Request(key.ID.String(), model, obs.NoProvider, e.status, obs.ResultRejected)
+		e.write(w, r)
+	}
+
 	body, aerr := s.decodeChatRequest(w, r)
 	if aerr != nil {
-		aerr.write(w, r)
+		refuse(obs.UnknownModel, aerr)
 		return
 	}
 	req, aerr := toInternal(body)
 	if aerr != nil {
-		aerr.write(w, r)
+		refuse(obs.UnknownModel, aerr)
 		return
 	}
 
 	model, err := s.opts.Router.Resolve(body.Model)
 	if err != nil {
-		(&apiError{status: http.StatusNotFound, typ: oai.ErrTypeNotFound, code: "model_not_found",
-			msg: fmt.Sprintf("The model %q does not exist.", body.Model)}).write(w, r)
+		refuse(obs.UnknownModel, &apiError{status: http.StatusNotFound, typ: oai.ErrTypeNotFound, code: "model_not_found",
+			msg: fmt.Sprintf("The model %q does not exist.", body.Model)})
 		return
 	}
 	estIn := s.opts.Estimator.Reserve(req)
@@ -111,21 +124,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var unsupported *router.UnsupportedError
 	switch {
 	case errors.Is(err, router.ErrUnknownPolicy):
-		badRequest("invalid_route_policy", "%s must be priority, cheapest, or fastest.", headerRoutePolicy).write(w, r)
+		refuse(model.Alias, badRequest("invalid_route_policy", "%s must be priority, cheapest, or fastest.", headerRoutePolicy))
 		return
 	case errors.As(err, &unsupported):
-		badRequest("unsupported_request", "%v", err).write(w, r)
+		refuse(model.Alias, badRequest("unsupported_request", "%v", err))
 		return
 	case err != nil:
 		obs.Logger(ctx).Error("routing failed", "err", err)
-		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
+		refuse(model.Alias, &apiError{status: http.StatusInternalServerError, typ: oai.ErrTypeAPI, code: "internal_error", msg: "Internal error."})
 		return
 	}
 
-	key, _ := auth.FromContext(ctx)
 	adm, aerr := s.admit(ctx, key, plan, estIn)
 	if aerr != nil {
-		aerr.write(w, r)
+		refuse(model.Alias, aerr)
 		return
 	}
 
@@ -141,7 +153,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		out = s.serveComplete(ctx, w, r, c)
 	}
-	s.conclude(ctx, adm, out)
+	s.conclude(ctx, adm, plan, out)
 }
 
 // serveComplete serves a non-streaming request. The response is written only
@@ -184,7 +196,7 @@ func (s *Server) serveComplete(ctx context.Context, w http.ResponseWriter, r *ht
 		Usage:   wireUsage(out.Usage),
 	})
 	a.Succeeded(out.Usage.CompletionTokens)
-	out.Result, out.Committed, out.Billable = resultCompleted, true, true
+	out.Status, out.Result, out.Committed, out.Billable = http.StatusOK, resultCompleted, true, true
 	return out
 }
 
@@ -217,11 +229,11 @@ func (s *Server) failPreCommit(w http.ResponseWriter, r *http.Request, out outco
 		out.Provider = ue.Provider
 	}
 	if clientGone(r) {
-		out.Result = resultClientDisconnected
+		out.Status, out.Result = statusClientClosed, resultClientDisconnected
 		return out
 	}
 	out.Result = resultUpstreamError
-	s.writeUpstreamError(w, r, out, err)
+	out.Status = s.writeUpstreamError(w, r, out, err)
 	return out
 }
 
@@ -247,6 +259,7 @@ func (s *Server) finish(ctx context.Context, out outcome) {
 		"finish_reason", out.FinishReason,
 		"ttft", out.TTFT,
 		"upstream_duration", out.Upstream,
+		"gateway_overhead", out.Overhead,
 	}
 	if out.Err != nil {
 		attrs = append(attrs, "err", out.Err.Error())
@@ -436,9 +449,10 @@ func isJSONObject(raw json.RawMessage) bool {
 }
 
 // writeUpstreamError answers a request where no attempt committed
-// (design §6.4): the client's bad request is passed through as 400,
-// timeouts are 504, every breaker open is 503, and other failures are 502.
-func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, out outcome, err error) {
+// (design §6.4), and returns the status: the client's bad request is passed
+// through as 400, timeouts are 504, every breaker open is 503, and other
+// failures are 502.
+func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, out outcome, err error) int {
 	log := obs.Logger(r.Context())
 	setRouteHeaders(w, out.Provider, out.Attempts)
 	var f *router.Failure
@@ -447,21 +461,24 @@ func (s *Server) writeUpstreamError(w http.ResponseWriter, r *http.Request, out 
 		w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(f.RetryAfter.Seconds())))))
 		oai.WriteError(w, r, http.StatusServiceUnavailable, oai.ErrTypeUpstream, "no_healthy_upstream",
 			"Every provider for this model is failing; try again later.")
-		return
+		return http.StatusServiceUnavailable
 	}
 	var ue *provider.UpstreamError
 	switch {
 	case errors.As(err, &ue) && ue.Kind == provider.KindBadRequest:
 		oai.WriteError(w, r, http.StatusBadRequest, oai.ErrTypeInvalidRequest, "upstream_rejected",
 			"The provider rejected the request: "+ue.Msg)
+		return http.StatusBadRequest
 	case errors.As(err, &ue) && ue.Kind == provider.KindTimeout, errors.Is(err, context.DeadlineExceeded):
 		oai.WriteError(w, r, http.StatusGatewayTimeout, oai.ErrTypeUpstream, "upstream_timeout",
 			"The provider did not respond in time.")
+		return http.StatusGatewayTimeout
 	case errors.As(err, &ue):
 		oai.WriteError(w, r, http.StatusBadGateway, oai.ErrTypeUpstream, "upstream_error",
 			"The provider failed to complete the request.")
-	default:
-		log.Error("upstream call failed", "err", err)
-		oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
+		return http.StatusBadGateway
 	}
+	log.Error("upstream call failed", "err", err)
+	oai.WriteError(w, r, http.StatusInternalServerError, oai.ErrTypeAPI, "internal_error", "Internal error.")
+	return http.StatusInternalServerError
 }

@@ -23,8 +23,8 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.PublicAddr != ":8080" || cfg.AdminAddr != ":8081" {
-		t.Errorf("addrs = %q, %q", cfg.PublicAddr, cfg.AdminAddr)
+	if cfg.PublicAddr != ":8080" || cfg.AdminAddr != ":8081" || cfg.MetricsAddr != ":9090" {
+		t.Errorf("addrs = %q, %q, %q", cfg.PublicAddr, cfg.AdminAddr, cfg.MetricsAddr)
 	}
 	if cfg.AuthCacheTTL != 10*time.Second || cfg.RequestTimeout != 10*time.Minute {
 		t.Errorf("durations = %v, %v", cfg.AuthCacheTTL, cfg.RequestTimeout)
@@ -97,5 +97,19 @@ func TestLoadReportsAllErrors(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention %s", err, want)
 		}
+	}
+}
+
+// A TTFT timeout at or above the request timeout turns failover off without
+// any other sign, so it must not start.
+func TestLoadRejectsConfigThatDisablesFailover(t *testing.T) {
+	_, err := Load(env(map[string]string{
+		"DATABASE_URL":    "postgres://x",
+		"REDIS_URL":       "redis://x",
+		"ROUTES_FILE":     "routes.yaml",
+		"REQUEST_TIMEOUT": "10s",
+	}))
+	if err == nil || !strings.Contains(err.Error(), "failover never happens") {
+		t.Errorf("err = %v", err)
 	}
 }

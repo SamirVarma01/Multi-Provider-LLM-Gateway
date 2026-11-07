@@ -43,6 +43,7 @@ type Options struct {
 	Ledger         Ledger
 	Reconciler     Reconciler // runs passes on demand for POST /admin/reconcile
 	Reports        Reports    // reads for the admin usage and ledger endpoints
+	Metrics        *obs.Metrics
 	Ready          []ReadyCheck
 	AdminToken     string
 	RequestTimeout time.Duration
@@ -66,6 +67,9 @@ type Server struct {
 func New(opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
+	}
+	if opts.Metrics == nil {
+		opts.Metrics = obs.NewMetrics()
 	}
 	stopping, stop := context.WithCancel(context.Background())
 	return &Server{opts: opts, now: time.Now, stopping: stopping, stop: stop}

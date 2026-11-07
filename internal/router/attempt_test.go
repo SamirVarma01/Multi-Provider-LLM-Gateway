@@ -455,3 +455,47 @@ func TestHalfOpenProbeIsHeldUntilTheAttemptEnds(t *testing.T) {
 	}
 	next.Succeeded(1)
 }
+
+func TestUpstreamWaitCoversEveryAttempt(t *testing.T) {
+	r, fakes := newTestRouter(t, policyRoutes, Options{Retry: fastRetry})
+	fakes["a"].stream = func(ctx context.Context, _ int) (provider.Stream, error) {
+		return &fakeStream{ctx: ctx, steps: []step{{delay: 30 * time.Millisecond, chunk: provider.Chunk{Role: "assistant"}}},
+			end: &provider.UpstreamError{Provider: "a", Kind: provider.KindTransport, Retryable: true, Msg: "reset"}}, nil
+	}
+	fakes["b"].stream = func(ctx context.Context, _ int) (provider.Stream, error) {
+		return &fakeStream{ctx: ctx, steps: []step{{delay: 30 * time.Millisecond, chunk: provider.Chunk{Content: "hi"}}}, end: io.EOF}, nil
+	}
+	m, _ := r.Resolve("m")
+	p, _ := r.Plan(m, Request{Chat: chatRequest(true)})
+	a, err := r.Execute(context.Background(), p, func(a *Attempt) error {
+		time.Sleep(50 * time.Millisecond) // the gateway's own time, not upstream's
+		return untilOutput(a)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Succeeded(1)
+	if p.UpstreamWait < 60*time.Millisecond || p.UpstreamWait >= 150*time.Millisecond {
+		t.Errorf("UpstreamWait = %v, want the two 30ms waits and not the 50ms sleeps", p.UpstreamWait)
+	}
+}
+
+func TestBreakerChangesAreReported(t *testing.T) {
+	var seen []string
+	r, _ := newTestRouter(t, policyRoutes, Options{OnBreakerChange: func(provider, model string, from, to BreakerState) {
+		seen = append(seen, provider+"/"+model+":"+from.String()+">"+to.String())
+	}})
+	want := []string{"a/ma:closed>closed", "b/mb:closed>closed", "c/mc:closed>closed"}
+	if strings.Join(seen, " ") != strings.Join(want, " ") {
+		t.Fatalf("initial reports = %v, want %v", seen, want)
+	}
+	seen = nil
+	m, _ := r.Resolve("m")
+	for range 5 {
+		tk, _ := m.Candidates[0].health.breaker.allow()
+		tk.failure()
+	}
+	if len(seen) != 1 || seen[0] != "a/ma:closed>open" {
+		t.Errorf("changes = %v", seen)
+	}
+}
