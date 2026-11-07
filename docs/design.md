@@ -1,7 +1,7 @@
 # LLM Gateway: Design
 
-Status: Phases 0–5 are implemented (through the ledger and reconciler); sections for
-later phases describe the plan. Defaults shown for config values are starting
+Status: Phases 0–6 are implemented (through observability); sections for later phases
+describe the plan. Defaults shown for config values are starting
 points, not measurements. All performance numbers will come from `scripts/` in Phase 7.
 
 ## 1. Scope
@@ -31,6 +31,8 @@ flowchart LR
   G -.tests/bench.-> M[Mock provider]
   REC[Reconciler<br/>in-process loop + CLI] --> P
   REC -.usage lookup.-> M
+  PR[Prometheus] -->|scrapes :9090| G
+  GR[Grafana] --> PR
 ```
 
 | Store | Holds | Why there |
@@ -105,7 +107,6 @@ All error bodies use the OpenAI shape: `{"error":{"message","type","code","reque
 | `GET /v1/models` | Lists aliases in OpenAI list format, with an extra `pricing` object (max input/output price per 1M tokens across candidates). |
 | `GET /healthz` | Liveness: the process is up. |
 | `GET /readyz` | Readiness: Postgres and Redis are reachable. |
-| `GET /metrics` | Prometheus (Phase 6). |
 
 ### Admin listener (`:8081`, `Authorization: Bearer $ADMIN_TOKEN`)
 
@@ -121,6 +122,44 @@ All error bodies use the OpenAI shape: `{"error":{"message","type","code","reque
 
 The admin API is on a separate listener so that it is not exposed when only `:8080`
 is published.
+
+### Metrics listener (`METRICS_ADDR`, default `:9090`; empty disables it)
+
+`GET /metrics` in Prometheus format, unauthenticated. It is a listener of its own because
+the metrics carry per-key spend (§14, D22). Compose does not publish it.
+
+| Metric | Labels | Notes |
+|---|---|---|
+| `gateway_requests_total` | `key, model, provider, status, result` | `status` stays 200 for a stream that failed after it committed, so `result` (`completed`, `upstream_error`, `client_disconnected`, `rejected`) tells those apart. 499 means the client left before any response. |
+| `gateway_requests_in_flight` | | |
+| `gateway_overhead_seconds` | `stream` | Histogram. Total latency minus time spent waiting on upstreams (§14, D23). |
+| `gateway_ttft_seconds` | `model, provider` | Histogram, for the attempt that served the request. |
+| `gateway_tokens_total` | `key, model, provider, type` | `type` is `prompt` or `completion`. |
+| `gateway_cost_usd_total` | `key, model, provider` | For dashboards. The ledger is exact. |
+| `gateway_failed_attempts_total` | `model` | Attempts that did not serve the request, whether or not a later one did. |
+| `gateway_breaker_state` | `provider, upstream_model` | 0 closed, 1 half open, 2 open. |
+| `gateway_breaker_transitions_total` | `provider, upstream_model, to` | |
+| `gateway_ratelimit_rejections_total` | `code` | By key, these are 429s in `gateway_requests_total`. |
+| `gateway_ratelimit_errors_total` | | Requests admitted without a limit because Redis failed. |
+| `gateway_reservations_total` | `result` | `reserved`, `insufficient_budget`, `error`. |
+| `gateway_reservations_open` | | Held by this process. Crash orphans are not included: only Postgres knows those. |
+| `gateway_reservation_closes_total` | `result, reason` | `settled`, `released`, `already_closed`, `failed` (left to the reconciler). |
+| `gateway_reconciler_passes_total` | `result` | `ok`, `skipped`, `error`. |
+| `gateway_reconciler_orphans_total` | `action` | `released_unknown_usage` is an undercharge. |
+
+Every label value is bounded by the route table, the set of keys, or a constant. A model
+that does not resolve is recorded as `unknown`, because clients choose that string.
+Series with known labels start at 0, so `rate` and `increase` can see their first event;
+series with a `key` label cannot, so a new key's first scrape interval is invisible to
+them. Metrics update when a request ends, before its close, so they do not lag behind
+Postgres.
+
+`gateway_requests_total`, `gateway_tokens_total`, and `gateway_cost_usd_total` have one
+series per key and label combination. That suits a modest number of keys; thousands would
+need the `key` label dropped.
+
+Compose runs Prometheus (`127.0.0.1:9091`) and Grafana (`127.0.0.1:3000`), with a
+provisioned dashboard as Grafana's home page. Its config is baked into the images.
 
 **Key format:** `gw_` + 32 random bytes, base64url-encoded. Only `sha256(key)` and a
 short display prefix are stored. A plain SHA-256 is enough because the keys are
@@ -447,6 +486,8 @@ Attempt loop (`Router.Execute`):
 4. Stop early when the error does not allow failover (the client's bad request), when
    the request context ends (client gone or `REQUEST_TIMEOUT`), or, before any attempt
    after the first, when less than the TTFT timeout remains before the request deadline.
+   A TTFT timeout at or above `REQUEST_TIMEOUT` would therefore turn failover off, so the
+   gateway refuses to start that way.
 5. If nothing commits, release the reservation and answer: 400 `upstream_rejected` for
    the client's bad request; 504 for timeouts; 503 `no_healthy_upstream` with
    `Retry-After` (seconds until the first breaker admits a probe) when every breaker
@@ -505,9 +546,9 @@ local now = t[1] * 1000 + math.floor(t[2] / 1000)       -- server clock, not the
 - 429 `rate_limit_exceeded` sets `Retry-After = ceil(wait_ms / 1000)`, minimum 1. If
   `tok_cost > tpm_limit` the request can never be admitted, so it gets 429
   `tokens_exceed_limit` with no `Retry-After`, without calling Redis.
-- **Redis unavailable → fail open**, with a warning log (and the `ratelimit_errors_total`
-  metric in Phase 6). Budgets are in Postgres, so money stays protected; only rate
-  fairness is lost while Redis is down. `RATELIMIT_TIMEOUT` (default 250ms) bounds what
+- **Redis unavailable → fail open**, with a warning log and
+  `gateway_ratelimit_errors_total`. Budgets are in Postgres, so money stays protected; only
+  rate fairness is lost while Redis is down. `RATELIMIT_TIMEOUT` (default 250ms) bounds what
   an unresponsive Redis adds to a request.
 
 ## 8. Budgets and the ledger
@@ -685,7 +726,7 @@ For each orphan, it looks up every target on the reserve entry that has a `usage
 |---|---|
 | A billable record | `settle` the **last** billable attempt, using its provider, model, and tokens, priced with the snapshot in the reserve's `meta`; `source='reconciler'`, reason `completed` or `interrupted` by the record's outcome (§14, D20) |
 | No billable record, and every target could be asked (call never happened, or failed before the first token) | `release(R)`, reason `orphan_no_call` |
-| No billable record, and some target has no `usage_url` (real providers have no per-request usage API) | `release(R)`, reason `orphan_unknown_usage`; log. No record then does not show that no call happened. **This is an undercharge, by design** |
+| No billable record, and some target has no `usage_url` (real providers have no per-request usage API) | `release(R)`, reason `orphan_unknown_usage`; metric + log. No record then does not show that no call happened. **This is an undercharge, by design** |
 | Lookup error (e.g. mock unreachable), or a billed model missing from the snapshot | skip; retry on the next pass rather than guess |
 
 `orphan_no_call` trusts a missing record, so a usage source must be complete: the mock
@@ -829,6 +870,7 @@ internal/estimate/    TokenEstimator
 internal/mock/        mock provider implementation
 internal/obs/         slog setup, request-ID middleware, metrics
 migrations/           SQL migrations
+deploy/               Prometheus and Grafana images, dashboard
 scripts/              loadtest/, failover_test/, ledger_chaos/, reconcile_check/
 bench/results/        committed benchmark output
 ```
@@ -878,3 +920,11 @@ Decided during Phase 5:
 | D19 | A provider opts in to usage lookups with `usage_url` in the route table | The reconciler must tell "this provider says no call happened" from "we cannot ask". One field per provider keeps that decision in the route table, and a request whose targets mix both kinds is treated as unknown. |
 | D20 | The reconciler charges the last billable attempt | The last attempt is the one that was serving the client when the gateway stopped; earlier attempts failed over, and those are not charged (§10). |
 | D21 | Append-only is enforced by triggers only, not also by grants | §8.2 first said the app role would have no UPDATE/DELETE grant, but the gateway connects as the database owner, which also runs migrations. A separate least-privilege role needs a second database URL. Cost: anyone with owner access can disable the triggers. Worth adding in a real deployment. |
+
+Decided during Phase 6:
+
+| # | Decision | Reason |
+|---|---|---|
+| D22 | `/metrics` has its own listener, not the public port as §4 first said | The metrics carry per-key spend, which anyone reaching `:8080` could otherwise read. The admin listener would need the token in Prometheus's config, and it is off when `ADMIN_TOKEN` is unset. |
+| D23 | Overhead subtracts time actually spent waiting on upstreams, added up per call | A stream interleaves waiting with the gateway's own encoding and writing, so subtracting one start-to-end span would hide per-chunk cost. Backoff counts as waiting. Time blocked on a slow client counts as overhead. |
+| D24 | Requests carry a `result` label beyond the plan's key, model, provider, and status | `status` is 200 for a stream that failed after it committed, so status alone would hide those failures. |
