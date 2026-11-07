@@ -1,9 +1,12 @@
 package obs
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -99,5 +102,69 @@ func TestRequestStartedTracksInFlight(t *testing.T) {
 	done()
 	if !strings.Contains(scrape(t, m), "gateway_requests_in_flight 0") {
 		t.Error("in flight should be 0")
+	}
+}
+
+// TestDashboardQueriesRealMetrics keeps the provisioned dashboard in step with
+// the code: a renamed metric would otherwise leave a panel quietly empty.
+func TestDashboardQueriesRealMetrics(t *testing.T) {
+	m := NewMetrics()
+	m.Request("k", "m", "p", 200, "completed")
+	m.Overhead(time.Millisecond, false)
+	m.TTFT(time.Millisecond, "m", "p")
+	m.Usage("k", "m", "p", 1, 1, 1)
+	m.FailedAttempts("m", 1)
+	m.BreakerChanged("p", "m", "closed", "open")
+	m.RateLimited("rate_limit_exceeded")
+	m.RateLimitError()
+	m.Reservation("reserved")
+	m.ReservationClosed("settled", "completed")
+	m.ReconcilePass("ok")
+	m.ReconcileOrphans("settled", 1)
+	families, err := m.Gatherer().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exists := map[string]bool{}
+	for _, f := range families {
+		exists[f.GetName()] = true
+	}
+
+	raw, err := os.ReadFile("../../deploy/grafana/dashboards/gateway.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dash struct {
+		Panels []struct {
+			Title   string `json:"title"`
+			Targets []struct {
+				Expr string `json:"expr"`
+			} `json:"targets"`
+		} `json:"panels"`
+	}
+	if err := json.Unmarshal(raw, &dash); err != nil {
+		t.Fatal(err)
+	}
+	name := regexp.MustCompile(`gateway_[a-z_]+`)
+	used := map[string]bool{}
+	for _, p := range dash.Panels {
+		for _, target := range p.Targets {
+			found := name.FindAllString(target.Expr, -1)
+			if len(found) == 0 {
+				t.Errorf("panel %q queries no gateway metric: %s", p.Title, target.Expr)
+			}
+			for _, n := range found {
+				n = strings.TrimSuffix(n, "_bucket")
+				used[n] = true
+				if !exists[n] {
+					t.Errorf("panel %q queries %s, which does not exist", p.Title, n)
+				}
+			}
+		}
+	}
+	for n := range exists {
+		if strings.HasPrefix(n, "gateway_") && !used[n] {
+			t.Logf("not on the dashboard: %s", n)
+		}
 	}
 }
