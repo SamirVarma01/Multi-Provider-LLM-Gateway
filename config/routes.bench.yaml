@@ -5,6 +5,7 @@ providers:
   - { name: bench, format: openai, base_url: "http://mock:9000/p/bench/v1", usage_url: "http://mock:9000" }
   - { name: primary, format: openai, base_url: "http://mock:9000/p/primary/v1", usage_url: "http://mock:9000" }
   - { name: backup, format: openai, base_url: "http://mock:9000/p/backup/v1", usage_url: "http://mock:9000" }
+  - { name: bench-claude, format: anthropic, base_url: "http://mock:9000/p/bench-claude/v1", usage_url: "http://mock:9000" }
 
 models:
   # loadtest: a single target, so routing has no choice to make.
@@ -17,3 +18,7 @@ models:
     candidates:
       - { provider: primary, model: m-fo, input_per_mtok: 0.15, output_per_mtok: 0.60, priority: 1, max_output: 4096 }
       - { provider: backup, model: m-fo, input_per_mtok: 0.20, output_per_mtok: 0.80, priority: 2, max_output: 4096 }
+  # ledger_chaos: the Anthropic adapter.
+  - alias: bench-claude
+    candidates:
+      - { provider: bench-claude, model: claude-bench, input_per_mtok: 3.00, output_per_mtok: 15.00, max_output: 8192 }

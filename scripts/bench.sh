@@ -4,6 +4,7 @@
 #
 #   scripts/bench.sh loadtest [loadtest flags]
 #   scripts/bench.sh failover [failover_test flags]
+#   scripts/bench.sh chaos    [ledger_chaos flags]
 #
 # The stack is a separate Compose project (llm-gateway-bench) on other ports,
 # with its own volumes, so it never touches the development stack. It starts
@@ -69,8 +70,25 @@ failover)
   go run ./scripts/failover_test -render "$out/failover.json" >"$out/failover.md"
   echo "wrote $out/failover.md"
   ;;
+chaos)
+  shift
+  # Short timeouts, so orphaned reservations become eligible for the
+  # reconciler within a minute of the last kill.
+  export REQUEST_TIMEOUT=20s ATTEMPT_TTFT_TIMEOUT=5s RECONCILE_GRACE=10s RECONCILE_INTERVAL=5s
+  up
+  container=$(dc ps -q gateway)
+  go run ./scripts/ledger_chaos \
+    -gateway "http://127.0.0.1:$GATEWAY_PORT" -admin "http://127.0.0.1:$GATEWAY_ADMIN_PORT" \
+    -mock "http://127.0.0.1:$MOCK_PORT" \
+    -database-url "postgres://gateway:gateway@127.0.0.1:$PG_PORT/gateway?sslmode=disable" \
+    -container "$container" -request-timeout "$REQUEST_TIMEOUT" -reconcile-grace "$RECONCILE_GRACE" \
+    "$@" >"$out/ledger_chaos.json.tmp"
+  mv "$out/ledger_chaos.json.tmp" "$out/ledger_chaos.json"
+  go run ./scripts/ledger_chaos -render "$out/ledger_chaos.json" >"$out/ledger_chaos.md"
+  echo "wrote $out/ledger_chaos.md"
+  ;;
 *)
-  echo "usage: $0 loadtest|failover [flags]" >&2
+  echo "usage: $0 loadtest|failover|chaos [flags]" >&2
   exit 2
   ;;
 esac
