@@ -65,7 +65,17 @@ func renderMarkdown(res *Results, w io.Writer) error {
 			detecting, during, secsFrom(sc.BreakerClosedMs, sc.ClearedMs))
 	}
 	p.f("\nThe breaker opened this long after the fault started, and closed this long after it was removed. ")
-	p.f("Added latency compares requests sent before the breaker opened with those sent before the fault.\n\n")
+	p.f("Added latency compares requests sent before the breaker opened with those sent before the fault.")
+	var worst float64
+	for _, sc := range res.Scenarios {
+		worst = max(worst, sc.MaxLagMs)
+	}
+	if worst > maxLagMs {
+		p.f(" **The load generator fell up to %.0f ms behind schedule, so the host stalled during this run; treat its timings with suspicion.**", worst)
+	} else {
+		p.f(" The load generator never started a request more than %.1f ms behind schedule.", worst)
+	}
+	p.f("\n\n")
 
 	for _, sc := range res.Scenarios {
 		p.f("## `%s`: %s\n\n", sc.Name, sc.Fault)
@@ -157,6 +167,10 @@ func ms(v float64) string {
 	}
 	return fmt.Sprintf("%.0f ms", v)
 }
+
+// maxLagMs is how far behind schedule the generator may fall before the
+// report flags the run.
+const maxLagMs = 50
 
 func latency(ph Phase) string {
 	if ph.Latency.N == 0 {

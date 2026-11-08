@@ -46,6 +46,9 @@ type Cell struct {
 	Workers int     `json:"workers,omitempty"` // closed loop
 	Keys    int     `json:"keys,omitempty"`    // gateway keys the requests rotate through
 
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+
 	Requests     int            `json:"requests"`
 	Errors       int            `json:"errors"`
 	ErrorKinds   map[string]int `json:"error_kinds,omitempty"`
@@ -267,7 +270,9 @@ func measure(ctx context.Context, c config, client *http.Client, keys []string, 
 		before = make(chan overheadSnapshot, 1)
 		load.OnMeasure = func() { before <- scrapeOverhead(ctx, client, c.metrics, cell.Stream) }
 	}
+	cell.Start = time.Now().UTC()
 	run := bench.Generate(ctx, load, send)
+	cell.End = time.Now().UTC()
 	if ctx.Err() != nil {
 		return cell, ctx.Err()
 	}

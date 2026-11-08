@@ -12,6 +12,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# A Mac that idle-sleeps mid-run freezes the Docker VM, and the run's numbers
+# are then meaningless, so keep it awake for the duration.
+if [[ "$(uname -s)" == Darwin && -z "${BENCH_CAFFEINATED:-}" ]] && command -v caffeinate >/dev/null; then
+  BENCH_CAFFEINATED=1 exec caffeinate -ims "$0" "$@"
+fi
+
 project=${BENCH_PROJECT:-llm-gateway-bench}
 out=bench/results
 mkdir -p "$out"

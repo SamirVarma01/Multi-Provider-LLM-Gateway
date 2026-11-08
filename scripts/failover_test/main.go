@@ -44,6 +44,8 @@ type Scenario struct {
 	ClearedMs       float64  `json:"cleared_ms"`                  // the fault was removed
 	BreakerClosedMs *float64 `json:"breaker_closed_ms,omitempty"` // first poll after the clear that saw the breaker closed
 
+	MaxLagMs float64 `json:"max_lag_ms"` // the most the generator started a request behind schedule
+
 	States      []StateChange  `json:"states"`      // breaker states as polled
 	Transitions map[string]int `json:"transitions"` // from gateway_breaker_transitions_total, by new state; polling can miss quick flips
 	Phases      []Phase        `json:"phases"`
@@ -276,6 +278,7 @@ func scenario(ctx context.Context, c config, client *http.Client, key, name stri
 		}
 	}
 	rel := func(t time.Time) float64 { return bench.Ms(t.Sub(t0)) }
+	sc.MaxLagMs = bench.Ms(run.MaxLag)
 	sc.ClearedMs = rel(t1)
 	for _, s := range poller.changes() {
 		sc.States = append(sc.States, StateChange{AtMs: rel(s.at), State: s.state})

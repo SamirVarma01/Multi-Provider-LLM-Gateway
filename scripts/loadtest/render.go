@@ -43,7 +43,45 @@ func renderMarkdown(res *Results, w io.Writer) error {
 	p.spread(res.Cells)
 	p.serverMetric(res.Cells)
 	p.errors(res.Cells)
+	p.lag(res.Cells)
 	return p.err
+}
+
+// maxLagMs is how far behind schedule the generator may start a request
+// before the report flags the level: a host that stalls (or sleeps) delays
+// the generator too, and the level's numbers then measure the host.
+const maxLagMs = 50
+
+func (p *printer) lag(cells []Cell) {
+	var worst float64
+	var flagged []string
+	for _, c := range cells {
+		worst = max(worst, c.MaxLagMs)
+		if c.MaxLagMs > maxLagMs {
+			flagged = append(flagged, fmt.Sprintf("| %s | %.0f |", describe(c), c.MaxLagMs))
+		}
+	}
+	p.f("\n## Generator lag\n\n")
+	if len(flagged) == 0 {
+		if pairsOpenLoop(cells) {
+			p.f("At fixed rates, the generator never started a request more than %.1f ms behind schedule.\n", worst)
+		}
+		return
+	}
+	p.f("At these levels the generator started a request more than %d ms behind schedule, so the host itself stalled; treat their numbers with suspicion.\n\n", maxLagMs)
+	p.f("| Level | Most behind schedule (ms) |\n|---|---:|\n")
+	for _, f := range flagged {
+		p.f("%s\n", f)
+	}
+}
+
+func pairsOpenLoop(cells []Cell) bool {
+	for _, c := range cells {
+		if c.Rate > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type printer struct {
