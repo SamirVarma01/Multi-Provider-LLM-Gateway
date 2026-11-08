@@ -3,6 +3,7 @@
 # results to bench/results/.
 #
 #   scripts/bench.sh loadtest [loadtest flags]
+#   scripts/bench.sh failover [failover_test flags]
 #
 # The stack is a separate Compose project (llm-gateway-bench) on other ports,
 # with its own volumes, so it never touches the development stack. It starts
@@ -61,8 +62,15 @@ loadtest)
   go run ./scripts/loadtest -render "$out/loadtest.json" >"$out/loadtest.md"
   echo "wrote $out/loadtest.md"
   ;;
+failover)
+  shift
+  up
+  run_in_network failover_test "$out/failover.json" "$@"
+  go run ./scripts/failover_test -render "$out/failover.json" >"$out/failover.md"
+  echo "wrote $out/failover.md"
+  ;;
 *)
-  echo "usage: $0 loadtest [flags]" >&2
+  echo "usage: $0 loadtest|failover [flags]" >&2
   exit 2
   ;;
 esac

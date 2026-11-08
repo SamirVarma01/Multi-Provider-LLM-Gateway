@@ -1,5 +1,5 @@
 .PHONY: build test test-integration test-live vet up down logs smoke reconcile reconcile-check \
-	bench bench-load
+	bench bench-load bench-failover
 
 build:
 	go build ./...
@@ -46,7 +46,10 @@ reconcile-check:
 
 # Benchmarks. Each runs on a fresh Compose project of its own,
 # separate from the stack above, and writes its report to bench/results/.
-bench: bench-load
+bench: bench-load bench-failover
 
 bench-load:
 	./scripts/bench.sh loadtest
+
+bench-failover:
+	./scripts/bench.sh failover
