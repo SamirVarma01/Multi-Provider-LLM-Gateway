@@ -31,8 +31,10 @@ export ADMIN_TOKEN=${BENCH_ADMIN_TOKEN:-dev-admin-token}
 unset REQUEST_TIMEOUT ATTEMPT_TTFT_TIMEOUT RECONCILE_GRACE RECONCILE_INTERVAL LOG_LEVEL
 export BENCH_PG_SYNCHRONOUS_COMMIT=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}
 
+# A run is marked dirty if code or config differ from the commit; edits to
+# documentation and to the results themselves do not count.
 commit=$(git rev-parse --short HEAD)
-git diff --quiet HEAD -- . ':(exclude)bench' || commit+="-dirty"
+git diff --quiet HEAD -- . ':(exclude)bench' ':(exclude)docs' ':(exclude)*.md' || commit+="-dirty"
 export BENCH_COMMIT=$commit
 cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
 export BENCH_HOST="$cpu, $(uname -s); Docker VM: $(docker info --format '{{.NCPU}} CPUs, {{.MemTotal}}' |
