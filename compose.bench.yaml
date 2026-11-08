@@ -8,9 +8,22 @@ services:
   postgres:
     command: ["postgres", "-c", "synchronous_commit=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}"]
 
+  # A load test sends a quarter of a million requests, and the gateway logs
+  # one line for each. The logging stays, since it is part of what a request
+  # costs, but its files are capped so a run cannot fill the disk.
   gateway:
     environment:
       ROUTES_FILE: /etc/gateway/routes.bench.yaml
+    logging: &capped
+      driver: json-file
+      options: { max-size: 20m, max-file: "2" }
+
+  # The mock never restarts during a benchmark, so it keeps its usage
+  # records in memory only.
+  mock:
+    environment:
+      MOCK_USAGE_FILE: ""
+    logging: *capped
 
   # The benchmark programs that need to be inside the network: they measure
   # latency, so both the direct and the gateway path must cross the same
