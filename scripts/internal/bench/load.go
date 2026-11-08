@@ -54,16 +54,32 @@ func Generate(ctx context.Context, l Load, send Send) Run {
 		defer t.Stop()
 	}
 	g.stop = l.Stop
+	// Sending ends at end, or earlier when Stop closes.
+	stopped := end
+	if l.Stop != nil {
+		done := make(chan struct{})
+		defer close(done)
+		var at atomic.Int64
+		go func() {
+			select {
+			case <-l.Stop:
+				at.Store(time.Now().UnixNano())
+			case <-done:
+			}
+		}()
+		g.stoppedAt = &at
+	}
 	if l.Rate > 0 {
 		g.openLoop(ctx, start, end, l.Rate)
 	} else {
 		g.closedLoop(ctx, end, max(l.Workers, 1))
 	}
-	stopped := time.Now()
-	if stopped.After(end) {
-		stopped = end
-	}
 	g.wg.Wait()
+	if g.stoppedAt != nil {
+		if ns := g.stoppedAt.Load(); ns != 0 && time.Unix(0, ns).Before(end) {
+			stopped = time.Unix(0, ns)
+		}
+	}
 	run := Run{Results: g.results, Elapsed: max(stopped.Sub(g.measureFrom), 0), InFlightMax: g.inFlightMax, MaxLag: g.maxLag}
 	if g.samples > 0 {
 		run.InFlightMean = float64(g.inFlightSum) / float64(g.samples)
@@ -83,6 +99,7 @@ func expected(l Load) int {
 type generator struct {
 	send        Send
 	stop        <-chan struct{} // nil never closes
+	stoppedAt   *atomic.Int64   // when stop closed, in Unix ns; 0 before
 	measureFrom time.Time
 	wg          sync.WaitGroup
 

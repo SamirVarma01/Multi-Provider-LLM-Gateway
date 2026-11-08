@@ -43,6 +43,9 @@ func TestGenerateOpenLoop(t *testing.T) {
 	if len(run.Results) != 40 {
 		t.Fatalf("measured %d requests, want 40", len(run.Results))
 	}
+	if run.Elapsed != 200*time.Millisecond {
+		t.Errorf("Elapsed = %v, want 200ms", run.Elapsed)
+	}
 	first := run.Results[0].Intended
 	for _, r := range run.Results {
 		if r.Intended.Before(first) {
@@ -99,6 +102,9 @@ func TestGenerateClosedLoop(t *testing.T) {
 	}
 	if n := len(run.Results); n < 15 || n > 33 {
 		t.Errorf("%d results, want about 30", n)
+	}
+	if run.Elapsed != 100*time.Millisecond {
+		t.Errorf("Elapsed = %v, want the 100ms the load ran", run.Elapsed)
 	}
 }
 
