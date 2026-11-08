@@ -123,3 +123,20 @@ func TestRepoRouteFiles(t *testing.T) {
 		}
 	}
 }
+
+// TestShippedRouteFiles loads every route table in config/, which the
+// images bake in, so a broken one fails here instead of at container start.
+func TestShippedRouteFiles(t *testing.T) {
+	paths, err := filepath.Glob("../../config/*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no route files found")
+	}
+	for _, p := range paths {
+		if _, err := LoadRoutes(p); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+}
