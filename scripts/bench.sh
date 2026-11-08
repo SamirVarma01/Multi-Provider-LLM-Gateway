@@ -29,6 +29,7 @@ export ADMIN_TOKEN=${BENCH_ADMIN_TOKEN:-dev-admin-token}
 # Settings from the caller's shell would leak into the stack; each benchmark
 # sets the ones it needs.
 unset REQUEST_TIMEOUT ATTEMPT_TTFT_TIMEOUT RECONCILE_GRACE RECONCILE_INTERVAL LOG_LEVEL
+export BENCH_PG_SYNCHRONOUS_COMMIT=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}
 
 commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- . ':(exclude)bench' || commit+="-dirty"
@@ -65,10 +66,16 @@ run_in_network() {
 case ${1:-} in
 loadtest)
   shift
+  # BENCH_PG_SYNCHRONOUS_COMMIT=off measures how much of the latency is the
+  # disk; that run's report gets a name of its own.
+  name=loadtest
+  if [[ "${BENCH_PG_SYNCHRONOUS_COMMIT:-on}" != on ]]; then
+    name=loadtest-synchronous-commit-$BENCH_PG_SYNCHRONOUS_COMMIT
+  fi
   up
-  run_in_network loadtest "$out/loadtest.json" "$@"
-  go run ./scripts/loadtest -render "$out/loadtest.json" >"$out/loadtest.md"
-  echo "wrote $out/loadtest.md"
+  run_in_network loadtest "$out/$name.json" "$@"
+  go run ./scripts/loadtest -render "$out/$name.json" >"$out/$name.md"
+  echo "wrote $out/$name.md"
   ;;
 failover)
   shift

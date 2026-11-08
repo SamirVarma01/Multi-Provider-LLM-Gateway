@@ -173,6 +173,8 @@ func benchmark(ctx context.Context, c config) (*Results, error) {
 		"max_tokens":  strconv.Itoa(c.maxTokens),
 		"warmup":      c.warmup.String(),
 		"duration":    c.duration.String(),
+		// The Postgres setting, as scripts/bench.sh passed it on.
+		"postgres_synchronous_commit": envOr("BENCH_PG_SYNCHRONOUS_COMMIT", "on"),
 	})}
 	runCell := func(cell Cell) error {
 		if ctx.Err() != nil {

@@ -2,6 +2,12 @@
 # project of its own (llm-gateway-bench), on its own ports and volumes, so a
 # benchmark never touches the development stack or its ledger.
 services:
+  # BENCH_PG_SYNCHRONOUS_COMMIT=off makes commits stop waiting for the disk.
+  # Only for measuring how much of the latency the disk adds; the gateway's
+  # ledger needs durable commits.
+  postgres:
+    command: ["postgres", "-c", "synchronous_commit=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}"]
+
   gateway:
     environment:
       ROUTES_FILE: /etc/gateway/routes.bench.yaml
@@ -14,6 +20,7 @@ services:
     build: { context: ., args: { PKG: ./scripts/loadtest } }
     environment:
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      BENCH_PG_SYNCHRONOUS_COMMIT: ${BENCH_PG_SYNCHRONOUS_COMMIT:-on}
       BENCH_COMMIT: ${BENCH_COMMIT:-}
       BENCH_HOST: ${BENCH_HOST:-}
 

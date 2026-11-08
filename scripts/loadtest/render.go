@@ -19,6 +19,11 @@ func renderMarkdown(res *Results, w io.Writer) error {
 		p.f(" at commit `%s`", m.Commit)
 	}
 	p.f(". Host: %s. The load generator saw %d CPUs.\n\n", orUnknown(m.Host), m.NumCPU)
+	if sc := s["postgres_synchronous_commit"]; sc != "" && sc != "on" {
+		p.f("> **Postgres ran with `synchronous_commit=%s`**, so commits did not wait for the WAL to reach disk. ", sc)
+		p.f("The gateway must not run this way: a Postgres crash could lose reservations for requests already sent upstream. ")
+		p.f("This run exists to show how much of the latency below is the disk; compare it with `loadtest.md`.\n\n")
+	}
 	p.f("Each level sends the same load twice: straight to the mock provider, and through the gateway to that same mock. ")
 	p.f("The mock's latency is fixed: first token after %s, then %s tokens at %s tokens/s. ", s["mock_ttft"], s["mock_tokens"], s["mock_tps"])
 	p.f("The direct run is the baseline, and the difference is what the gateway adds: authentication, the Redis rate limit, ")
