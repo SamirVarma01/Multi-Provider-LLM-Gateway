@@ -1,0 +1,19 @@
+# Overrides for the benchmark stack. scripts/bench.sh runs it as a Compose
+# project of its own (llm-gateway-bench), on its own ports and volumes, so a
+# benchmark never touches the development stack or its ledger.
+services:
+  gateway:
+    environment:
+      ROUTES_FILE: /etc/gateway/routes.bench.yaml
+
+  # The benchmark programs that need to be inside the network: they measure
+  # latency, so both the direct and the gateway path must cross the same
+  # Docker network, not the host's port forwarding.
+  loadtest:
+    profiles: [bench]
+    build: { context: ., args: { PKG: ./scripts/loadtest } }
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      BENCH_COMMIT: ${BENCH_COMMIT:-}
+      BENCH_HOST: ${BENCH_HOST:-}
+

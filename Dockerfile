@@ -1,13 +1,15 @@
 # syntax=docker/dockerfile:1
-# Builds one binary from ./cmd/${CMD} (gateway, mockprovider, or reconcile).
+# Builds one binary: ./cmd/${CMD} (gateway, mockprovider, or reconcile), or the
+# package in PKG (the benchmark programs under scripts/).
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
 ARG CMD
+ARG PKG=./cmd/${CMD}
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${CMD}
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ${PKG}
 
 FROM alpine:3.22
 # /data is owned by the runtime user so named volumes mounted there are writable.

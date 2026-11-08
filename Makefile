@@ -1,4 +1,5 @@
-.PHONY: build test test-integration test-live vet up down logs smoke reconcile reconcile-check
+.PHONY: build test test-integration test-live vet up down logs smoke reconcile reconcile-check \
+	bench bench-load
 
 build:
 	go build ./...
@@ -42,3 +43,10 @@ reconcile-check:
 	DATABASE_URL=postgres://gateway:gateway@127.0.0.1:$${PG_PORT:-5432}/gateway?sslmode=disable \
 	MOCK_URL=http://127.0.0.1:$${MOCK_PORT:-9000} \
 	go run ./scripts/reconcile_check $(CHECK_FLAGS)
+
+# Benchmarks. Each runs on a fresh Compose project of its own,
+# separate from the stack above, and writes its report to bench/results/.
+bench: bench-load
+
+bench-load:
+	./scripts/bench.sh loadtest

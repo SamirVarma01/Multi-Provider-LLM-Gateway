@@ -1,0 +1,11 @@
+# Route table for the benchmark stack (scripts/bench.sh). Every provider is a
+# virtual provider on the mock; the benchmark scripts set their behavior at
+# runtime through the mock's control API.
+providers:
+  - { name: bench, format: openai, base_url: "http://mock:9000/p/bench/v1", usage_url: "http://mock:9000" }
+
+models:
+  # loadtest: a single target, so routing has no choice to make.
+  - alias: bench
+    candidates:
+      - { provider: bench, model: m-bench, input_per_mtok: 0.15, output_per_mtok: 0.60, max_output: 4096 }
