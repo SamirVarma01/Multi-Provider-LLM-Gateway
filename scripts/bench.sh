@@ -5,6 +5,7 @@
 #   scripts/bench.sh loadtest [loadtest flags]
 #   scripts/bench.sh failover [failover_test flags]
 #   scripts/bench.sh chaos    [ledger_chaos flags]
+#   scripts/bench.sh postgres
 #
 # The stack is a separate Compose project (llm-gateway-bench) on other ports,
 # with its own volumes, so it never touches the development stack. It starts
@@ -93,8 +94,15 @@ chaos)
   go run ./scripts/ledger_chaos -render "$out/ledger_chaos.json" >"$out/ledger_chaos.md"
   echo "wrote $out/ledger_chaos.md"
   ;;
+postgres)
+  dc down -v --remove-orphans >/dev/null 2>&1 || true
+  dc up -d --wait postgres
+  dc exec -T -e BENCH_COMMIT -e BENCH_HOST postgres sh -s <scripts/pg_commit_latency.sh >"$out/postgres_commit.md.tmp"
+  mv "$out/postgres_commit.md.tmp" "$out/postgres_commit.md"
+  echo "wrote $out/postgres_commit.md"
+  ;;
 *)
-  echo "usage: $0 loadtest|failover|chaos [flags]" >&2
+  echo "usage: $0 loadtest|failover|chaos|postgres [flags]" >&2
   exit 2
   ;;
 esac
