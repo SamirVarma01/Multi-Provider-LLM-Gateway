@@ -243,10 +243,9 @@ func (q *auditRow) auditProviderUsage(rep *AuditReport, stats *SettleStats, recs
 	stats.Compared++
 	last := lastBillable(recs)
 	var diff []string
-	switch {
-	case last == nil:
+	if last == nil {
 		diff = append(diff, "no billable provider record")
-	default:
+	} else {
 		if q.provider == nil || last.Provider != *q.provider || q.model == nil || last.Model != *q.model {
 			diff = append(diff, fmt.Sprintf("target: provider recorded %s/%s", last.Provider, last.Model))
 		}

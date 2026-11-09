@@ -38,7 +38,7 @@ func request() *provider.ChatRequest {
 func setup(t *testing.T, b mock.Behavior, wrap func(http.Handler) http.Handler) (*mock.Server, *Provider) {
 	t.Helper()
 	m := mock.New(mock.Options{Defaults: b, Seed: 7})
-	var h http.Handler = m.Handler()
+	h := m.Handler()
 	if wrap != nil {
 		h = wrap(h)
 	}

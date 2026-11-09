@@ -49,7 +49,7 @@ func newClient(t *testing.T) *http.Client {
 func setup(t *testing.T, b mock.Behavior, wrap func(http.Handler) http.Handler) (*mock.Server, *Provider) {
 	t.Helper()
 	m := mock.New(mock.Options{Defaults: b, Seed: 11})
-	var h http.Handler = m.Handler()
+	h := m.Handler()
 	if wrap != nil {
 		h = wrap(h)
 	}
