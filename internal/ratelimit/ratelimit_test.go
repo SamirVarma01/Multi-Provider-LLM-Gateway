@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strconv"
 	"sync"
@@ -38,7 +39,7 @@ func admit(t *testing.T, l *Limiter, id uuid.UUID, lim Limits, tokens int) Decis
 func level(t *testing.T, rdb *redis.Client, key string) float64 {
 	t.Helper()
 	v, err := rdb.HGet(context.Background(), key, "tokens").Result()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return -1
 	}
 	if err != nil {

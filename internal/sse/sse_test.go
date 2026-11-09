@@ -31,7 +31,7 @@ func TestReader(t *testing.T) {
 			t.Errorf("event %d = {%q %q}, want {%q %q}", i, ev.Event, ev.Data, w.Event, w.Data)
 		}
 	}
-	if _, err := r.Next(); err != io.EOF {
+	if _, err := r.Next(); !errors.Is(err, io.EOF) {
 		t.Errorf("after last event: err = %v, want io.EOF", err)
 	}
 }

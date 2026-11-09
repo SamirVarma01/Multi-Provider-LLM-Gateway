@@ -151,7 +151,7 @@ func TestMidStreamFailures(t *testing.T) {
 				t.Error("usage must not be reported for an interrupted stream")
 			}
 			// The error is sticky.
-			if _, err2 := s.Recv(); err2 != err {
+			if _, err2 := s.Recv(); !errors.Is(err2, err) {
 				t.Errorf("second Recv = %v, want %v", err2, err)
 			}
 		})
