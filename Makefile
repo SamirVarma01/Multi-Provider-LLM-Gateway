@@ -1,4 +1,4 @@
-.PHONY: build test test-integration test-live vet up down logs smoke reconcile reconcile-check \
+.PHONY: build test test-integration test-live vet lint check up down logs smoke reconcile reconcile-check \
 	bench bench-load bench-failover bench-chaos bench-postgres
 
 build:
@@ -20,6 +20,16 @@ test-live:
 vet:
 	go vet ./...
 	go vet -tags live ./...
+
+# golangci-lint v2 (https://github.com/golangci/golangci-lint/releases), from PATH
+# or from $(go env GOPATH)/bin. .golangci.yml lints the live tests too.
+GOLANGCI_LINT ?= $(or $(shell command -v golangci-lint 2>/dev/null),$(shell go env GOPATH)/bin/golangci-lint)
+
+lint:
+	$(GOLANGCI_LINT) run ./...
+
+# Everything to run before a commit.
+check: vet lint test-integration
 
 up:
 	docker compose up -d --build --wait

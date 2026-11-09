@@ -1,0 +1,49 @@
+# golangci-lint v2. Run with `make lint`.
+version: "2"
+
+run:
+  # The live provider tests are behind a build tag; lint them too.
+  build-tags: [live]
+
+linters:
+  # errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - unconvert
+    - usestdlibvars
+  settings:
+    errcheck:
+      exclude-functions:
+        # Closing a response body after reading it cannot lose anything.
+        - (io.ReadCloser).Close
+  exclusions:
+    rules:
+      # Tests run under goleak, which catches a leaked connection or goroutine
+      # for real. bodyclose cannot see bodies closed by test helpers, and
+      # contexts and Close errors in test setup are noise.
+      - path: _test\.go
+        linters: [bodyclose, noctx]
+      - path: _test\.go
+        linters: [errcheck]
+        text: "Error return value of `.*Close` is not checked"
+      - path: internal/testutil/
+        linters: [noctx]
+
+issues:
+  # Report every issue, not just the first few of each kind.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes: [github.com/SamirVarma01/llm-gateway]
