@@ -31,8 +31,6 @@ flowchart LR
   G -.tests/bench.-> M[Mock provider]
   REC[Reconciler<br/>in-process loop + CLI] --> P
   REC -.usage lookup.-> M
-  PR[Prometheus] -->|scrapes :9090| G
-  GR[Grafana] --> PR
 ```
 
 | Store | Holds | Why there |
@@ -158,8 +156,8 @@ Postgres.
 series per key and label combination. That suits a modest number of keys; thousands would
 need the `key` label dropped.
 
-Compose runs Prometheus (`127.0.0.1:9091`) and Grafana (`127.0.0.1:3000`), with a
-provisioned dashboard as Grafana's home page. Its config is baked into the images.
+Compose runs no Prometheus server. A scraper inside the Compose network reaches the
+metrics at `gateway:9090`.
 
 **Key format:** `gw_` + 32 random bytes, base64url-encoded. Only `sha256(key)` and a
 short display prefix are stored. A plain SHA-256 is enough because the keys are
@@ -870,7 +868,6 @@ internal/estimate/    TokenEstimator
 internal/mock/        mock provider implementation
 internal/obs/         slog setup, request-ID middleware, metrics
 migrations/           SQL migrations
-deploy/               Prometheus and Grafana images, dashboard
 scripts/              loadtest/, failover_test/, ledger_chaos/, reconcile_check/
 bench/results/        committed benchmark output
 ```
