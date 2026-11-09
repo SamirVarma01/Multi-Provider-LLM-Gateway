@@ -408,15 +408,17 @@ func (s *Server) complete(w http.ResponseWriter, r *http.Request, c *call, b Beh
 	f wireFormat, comp completion, tokens []string) {
 	ctx := r.Context()
 	start := time.Now()
+	// A non-streaming response keeps the stream's timing: it ends, or fails,
+	// when the stream would have.
 	if b.FailAfterTokens > 0 && b.FailAfterTokens <= len(tokens) {
 		// Nothing has been sent, so nothing is billable.
-		if err := sleepUntil(ctx, tokenDue(start, b.FailAfterTokens, b.TokensPerSec)); err != nil {
+		if err := sleepUntil(ctx, lastTokenDue(start, b.FailAfterTokens, b.TokensPerSec)); err != nil {
 			return
 		}
 		s.finish(c, OutcomeMidStreamFailure)
 		panic(http.ErrAbortHandler)
 	}
-	if err := sleepUntil(ctx, tokenDue(start, len(tokens), b.TokensPerSec)); err != nil {
+	if err := sleepUntil(ctx, lastTokenDue(start, len(tokens), b.TokensPerSec)); err != nil {
 		return
 	}
 	comp.text = strings.Join(tokens, "")
@@ -531,6 +533,11 @@ func tokenDue(start time.Time, i int, tokensPerSec float64) time.Time {
 		return start
 	}
 	return start.Add(time.Duration(float64(i) / tokensPerSec * float64(time.Second)))
+}
+
+// lastTokenDue is when the last of n tokens should be emitted.
+func lastTokenDue(start time.Time, n int, tokensPerSec float64) time.Time {
+	return tokenDue(start, max(n-1, 0), tokensPerSec)
 }
 
 // sleepUntil waits until t or until ctx is done, whichever is first.

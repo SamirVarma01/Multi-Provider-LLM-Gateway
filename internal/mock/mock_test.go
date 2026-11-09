@@ -336,6 +336,21 @@ func TestPacing(t *testing.T) {
 	}
 }
 
+// TestNonStreamPacing checks that a non-streaming response ends when the
+// stream's last token would have gone out, not one token later, so the two
+// modes can be compared in benchmarks.
+func TestNonStreamPacing(t *testing.T) {
+	_, ts := newServer(t, Behavior{OutputTokens: 3, TokensPerSec: 10})
+	start := time.Now()
+	resp := post(t, context.Background(), ts.URL+"/v1/chat/completions", chatBody(false, false, nil), nil)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	// Tokens at 0, 100 and 200ms; one token later would be 300ms.
+	if d := time.Since(start); d < 200*time.Millisecond || d >= 280*time.Millisecond {
+		t.Errorf("non-streaming response took %v, want 200ms to 280ms", d)
+	}
+}
+
 func TestBehaviorEndpointsAndHeaderOverrides(t *testing.T) {
 	s, ts := newServer(t, Behavior{OutputTokens: 5})
 

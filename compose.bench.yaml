@@ -1,0 +1,46 @@
+# Overrides for the benchmark stack. scripts/bench.sh runs it as a Compose
+# project of its own (llm-gateway-bench), on its own ports and volumes, so a
+# benchmark never touches the development stack or its ledger.
+services:
+  # BENCH_PG_SYNCHRONOUS_COMMIT=off makes commits stop waiting for the disk.
+  # Only for measuring how much of the latency the disk adds; the gateway's
+  # ledger needs durable commits.
+  postgres:
+    command: ["postgres", "-c", "synchronous_commit=${BENCH_PG_SYNCHRONOUS_COMMIT:-on}"]
+
+  # A load test sends a quarter of a million requests, and the gateway logs
+  # one line for each. The logging stays, since it is part of what a request
+  # costs, but its files are capped so a run cannot fill the disk.
+  gateway:
+    environment:
+      ROUTES_FILE: /etc/gateway/routes.bench.yaml
+    logging: &capped
+      driver: json-file
+      options: { max-size: 20m, max-file: "2" }
+
+  # The mock never restarts during a benchmark, so it keeps its usage
+  # records in memory only.
+  mock:
+    environment:
+      MOCK_USAGE_FILE: ""
+    logging: *capped
+
+  # The benchmark programs that need to be inside the network: they measure
+  # latency, so both the direct and the gateway path must cross the same
+  # Docker network, not the host's port forwarding.
+  loadtest:
+    profiles: [bench]
+    build: { context: ., args: { PKG: ./scripts/loadtest } }
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      BENCH_PG_SYNCHRONOUS_COMMIT: ${BENCH_PG_SYNCHRONOUS_COMMIT:-on}
+      BENCH_COMMIT: ${BENCH_COMMIT:-}
+      BENCH_HOST: ${BENCH_HOST:-}
+
+  failover_test:
+    profiles: [bench]
+    build: { context: ., args: { PKG: ./scripts/failover_test } }
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      BENCH_COMMIT: ${BENCH_COMMIT:-}
+      BENCH_HOST: ${BENCH_HOST:-}
