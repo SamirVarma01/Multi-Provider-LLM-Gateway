@@ -1,8 +1,9 @@
 # LLM Gateway: Design
 
-Status: Phases 0–6 are implemented (through observability); sections for later phases
-describe the plan. Defaults shown for config values are starting
-points, not measurements. All performance numbers will come from `scripts/` in Phase 7.
+Status: Phases 0–7 are implemented (through benchmarks); sections for later phases
+describe the plan. Defaults shown for config values are starting points, not
+measurements. Every performance number comes from a script in `scripts/`, and each run's
+report is committed in `bench/results/` (§15).
 
 ## 1. Scope
 
@@ -91,7 +92,8 @@ resolves it (§9).
 client asked for a non-streaming response, and builds the JSON body itself. That leaves
 one code path, gives a TTFT measurement on every request (used by the `fastest`
 policy), and gives partial usage when a request is cut off. The cost is building
-non-stream responses ourselves; Phase 7 measures what that costs.
+non-stream responses ourselves, which turns out not to be measurable: non-streaming
+requests show the gateway's lowest overhead (§15.1).
 
 ## 4. API surface
 
@@ -271,9 +273,9 @@ The output cap is sent as `max_tokens` by default, which most OpenAI-compatible
 servers accept. A provider can set `max_tokens_field: max_completion_tokens` in the
 route table, which newer OpenAI models require.
 
-Chunks are parsed into `Chunk` and re-encoded. That decode/encode per chunk costs CPU;
-if Phase 7 shows it matters, we switch to forwarding the raw bytes for OpenAI→OpenAI
-and scanning only for `usage`.
+Chunks are parsed into `Chunk` and re-encoded. That decode/encode per chunk costs CPU,
+but the whole streaming overhead, parsing included, is 0.5–1.6 ms at the median
+(§15.1), so there is no raw-bytes path for OpenAI→OpenAI (§14, D29).
 
 ### 5.4 Anthropic adapter (Messages API)
 
@@ -649,7 +651,7 @@ The `UPDATE` takes the row lock. Under READ COMMITTED, Postgres re-checks the `W
 against the latest row version after waiting for the lock. Concurrent reservations
 therefore serialize per key, and the sum of reservations can never pass the budget.
 The cost: requests for the same key queue on one row lock for the length of a short
-transaction. Throughput for a single hot key is limited by that, and Phase 7 measures it.
+transaction. That limits a single hot key's throughput, and §15.2 measures where.
 
 **Settle** (gateway or reconciler) is also one statement, using data-modifying CTEs:
 
@@ -849,7 +851,10 @@ added in Phase 2 for adapter tests).
 reconciler are compared with the mock's records, and they were settled *from* those
 records, so they agree by construction. The test is meaningful for (a) requests settled
 by the gateway, compared against the mock, (b) no request being closed twice, and
-(c) no reservation left open after the drain. The report will show these separately.
+(c) no reservation left open after the drain. The report shows these separately, and
+adds two checks the audit cannot make: that the mock billed no request the ledger has no
+reservation for, and that every complete response's reported usage equals its charge
+(§15).
 
 ## 13. Repository layout (preview of Phase 1)
 
@@ -868,8 +873,10 @@ internal/estimate/    TokenEstimator
 internal/mock/        mock provider implementation
 internal/obs/         slog setup, request-ID middleware, metrics
 migrations/           SQL migrations
-scripts/              loadtest/, failover_test/, ledger_chaos/, reconcile_check/
-bench/results/        committed benchmark output
+scripts/              loadtest/, failover_test/, ledger_chaos/, reconcile_check/,
+                      internal/bench/ (shared by the benchmarks), bench.sh, pg_commit_latency.sh
+compose.bench.yaml    the benchmark stack's overrides; config/routes.bench.yaml is its route table
+bench/results/        committed benchmark reports
 ```
 
 ## 14. Decisions to confirm in review
@@ -925,3 +932,132 @@ Decided during Phase 6:
 | D22 | `/metrics` has its own listener, not the public port as §4 first said | The metrics carry per-key spend, which anyone reaching `:8080` could otherwise read. The admin listener would need the token in Prometheus's config, and it is off when `ADMIN_TOKEN` is unset. |
 | D23 | Overhead subtracts time actually spent waiting on upstreams, added up per call | A stream interleaves waiting with the gateway's own encoding and writing, so subtracting one start-to-end span would hide per-chunk cost. Backoff counts as waiting. Time blocked on a slow client counts as overhead. |
 | D24 | Requests carry a `result` label beyond the plan's key, model, provider, and status | `status` is 200 for a stream that failed after it committed, so status alone would hide those failures. |
+
+Decided during Phase 7:
+
+| # | Decision | Reason |
+|---|---|---|
+| D25 | Benchmarks run on a Compose project of their own, and the latency benchmarks run inside its network | Every run starts from an empty ledger, and the development stack's ledger is never touched. On macOS, port forwarding adds latency and jitter of its own, which would land on both paths and blur a difference of a millisecond. |
+| D26 | Overhead is the difference between percentiles of a direct run and a gateway run at the same load, with latency measured from each request's scheduled start | The two runs send different requests, so there is no per-request difference to take. Measuring from the schedule keeps a generator that falls behind from hiding latency. Cost: p99 differences are noisy, and can be negative. |
+| D27 | Reservations stay durable before the upstream call, though disk-flush stalls then reach request latency | Committing without waiting for the disk (`synchronous_commit=off`) cuts one key's p99 overhead at 1000 requests/s from 186 ms to 38 ms (§15.2, measured with every commit not waiting). But a Postgres crash could then lose reservations for requests already sent upstream, and those would go uncharged and unchecked against the budget. |
+| D28 | The per-key throughput limit stays for v1 | One key's reservations and settlements serialize on its account row (D1). On the benchmark laptop, at 1000 requests/s through one key, p99 overhead reaches 186 ms, against 27 ms for the same load spread over 16 keys (§15.2). Raising it means holding budget outside Postgres, for example leasing slices of a key's budget to each gateway process, which changes what a budget guarantees. |
+| D29 | Chunks stay parsed and re-encoded, with no raw-bytes path for OpenAI→OpenAI (§5.3 left this to Phase 7) | The streaming median overhead, which includes parsing and re-encoding every chunk, is 0.5–1.6 ms (§15.1). Forwarding raw bytes would save part of that and add a second code path. |
+
+## 15. Benchmarks
+
+Every number in this section comes from a report in `bench/results/`, written by the
+script it names. The committed reports were all generated at commit `5b8bab0`, on one
+laptop: an Apple M2, with Docker Desktop's VM at 8 CPUs and 3.8 GiB. The load generator,
+gateway, mock, Postgres and Redis share that VM, so the numbers compare the gateway with
+calling the mock directly on the same machine. They are not a server's capacity.
+
+| Report | Command | Took |
+|---|---|---:|
+| `loadtest.md` | `make bench-load` | 14 min |
+| `loadtest-synchronous-commit-off.md` | `BENCH_PG_SYNCHRONOUS_COMMIT=off make bench-load` | 14 min |
+| `failover.md` | `make bench-failover` | 3 min |
+| `ledger_chaos.md` | `make bench-chaos` | 3 min |
+| `postgres_commit.md` | `make bench-postgres` | 3 min |
+
+`make bench` runs all but the second. Each run starts a fresh Compose project of its own
+(D25), keeps the Mac awake, and stops if the disk drops below 1 GB free, because a full
+disk crashes Docker. A report's commit is marked `-dirty` if code or config differed from
+it. Each report says how it measures; the load test also flags any level where the
+generator itself fell behind schedule by more than 50 ms.
+
+### 15.1 Gateway overhead (`loadtest.md`)
+
+The mock answers after 50 ms, then sends 32 tokens at 100 tokens/s. Every level runs
+once straight to the mock and once through the gateway, through one key, and overhead is
+the difference of the two runs' percentiles (D26). There were no errors in 256,657
+measured requests.
+
+- **Median:** at fixed rates from 50 to 1000 req/s, the gateway adds 0.5–1.7 ms to the
+  time to first token, 0.5–1.6 ms to a full streaming response, and 0.0–0.7 ms to a
+  non-streaming one.
+- **Tail, up to 200 req/s:** p99 overhead is at most 5.7 ms.
+- **Tail, one key at 500 and 1000 req/s:** p99 overhead is 11–28 ms at 500 req/s and
+  98–186 ms at 1000 req/s, where p95 is 34–52 ms. §15.2 explains this.
+- **Fixed concurrency** (10, 50 and 200 workers): the medians differ by −5.1 to
+  +5.1 ms. The negative values show that this mode's noise is that large, so the
+  fixed-rate numbers are the ones to read.
+- **The gateway's own metric** agrees: at every fixed rate, the mean of
+  `gateway_overhead_seconds` is within 1.5 ms of the client-measured mean overhead. It
+  reads slightly higher, as it should, because it counts time spent writing to the client
+  (D23), which the direct path also spends.
+
+### 15.2 Where the tail comes from (`loadtest-synchronous-commit-off.md`, `postgres_commit.md`)
+
+The same load test, with Postgres not waiting for the WAL to reach disk before a commit
+returns, isolates the disk's share. For one key at 1000 req/s:
+
+| Overhead (ms) | p95, commits wait for the disk | p95, they don't | p99, commits wait for the disk | p99, they don't |
+|---|---:|---:|---:|---:|
+| Streaming, first token | 52.4 | 5.0 | 186.1 | 38.3 |
+| Non-streaming, full response | 34.2 | 0.1 | 98.2 | −4.0 |
+
+Two things combine:
+
+- **Disk flushes.** Each reservation and settlement holds its key's account row lock
+  until its commit is durable, so one slow flush delays every request queued behind it on
+  that row. At 1000 req/s, that is about 2000 commits a second on one row.
+- **Queueing on the row.** Without disk waits, streaming at 1000 req/s through one key
+  still has a p99 of 38 ms, against 0.2 ms for the same load over 16 keys. With them,
+  spreading the load over 16 keys brings p99 from 186 ms down to 27 ms.
+
+Postgres on its own, measured with `pgbench` in the same container, at 1000 single-row
+updates/s: p99.9 commit latency is 18.1 ms when commits wait for the disk and 11.6 ms when
+they don't, with maxima of 41.8 and 21.2 ms. Unthrottled, one row takes 5994 updates/s
+and 16 rows 19,869. The gateway's transactions are heavier than these (each also inserts
+a ledger entry under the lock).
+
+So the gateway's own cost is about a millisecond, and its tail at high per-key rates is
+the price of a durable, row-locked budget. D27 keeps the durability; D28 keeps the
+per-key limit. In the run without disk waits, one level is flagged: non-streaming
+through 16 keys at 1000 req/s, where the host stalled for 147 ms. Its numbers mean
+nothing.
+
+### 15.3 Failover (`failover.md`)
+
+50 req/s through one key to the `failover` alias (primary first, then backup). Each
+fault lasts 30 s on the primary, then the primary is healthy again.
+
+| Fault | Breaker opened after | Client errors during the fault | Breaker closed after the fix |
+|---|---:|---:|---:|
+| HTTP 500 before any output | 0.20 s | 0 of 1500 | 5.65 s |
+| Accepted, never answered | 10.10 s | 0 of 1500 | 5.55 s |
+| Cut off after 4 tokens | 0.30 s | 8 of 1500, all streaming | 5.95 s |
+
+- **Errors before any output** are invisible to clients: each failed attempt is
+  retried on the backup.
+- **A hanging provider** is found only by the 10 s first-output timeout. Requests
+  sent in those first 10 s waited for it (p50 10.2 s) and were then served by the
+  backup; none failed. Lowering `ATTEMPT_TTFT_TIMEOUT` shortens this, at the risk of
+  abandoning slow but healthy providers.
+- **A cut-off stream** fails only for streaming clients that had already received
+  output, because there is no failover after the first byte (§12). Non-streaming clients
+  had received nothing, so their requests were retried.
+- **How soon the breaker closes after the fix** depends on where its back-off stands.
+  It waits 5 s after opening and doubles the wait after each failed probe, up to 60 s.
+  In these runs its last wait happened to end 5.2–5.5 s after the fix, and the two
+  successful probes then took 0.40–0.45 s. A provider that recovers can therefore wait up
+  to a minute for traffic.
+
+### 15.4 The ledger through crashes (`ledger_chaos.md`)
+
+The gateway was killed with SIGKILL 20 times, every 3–8 s, under 40 req/s of mixed load:
+both adapters, streaming and non-streaming, and a primary that fails 10% of attempts.
+After draining and reconciling, the result was **0 ledger discrepancies against the
+mock's usage records, 0 double charges, and 0 orphaned reservations**. Of 5662 requests
+sent, 4554 were reserved. The gateway charged 3827 of them, every one matching the mock's
+record. The reconciler charged 646 from the mock's records and released 81 that never
+reached a provider. Each of the 2861 complete responses that reported usage reported
+exactly what was charged.
+
+### 15.5 Not measured
+
+- Real providers. Every benchmark uses the mock.
+- More than one gateway instance.
+- The gateway's maximum throughput. The generator shares the VM, so 1000 req/s is
+  the highest load tested, not a limit that was found.
+- How close the token estimate is to real counts (§12).
