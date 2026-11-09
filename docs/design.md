@@ -1,8 +1,8 @@
 # LLM Gateway: Design
 
-Status: Phases 0–7 are implemented (through benchmarks); sections for later phases
-describe the plan. Defaults shown for config values are starting points, not
-measurements. Every performance number comes from a script in `scripts/`, and each run's
+Status: Phases 0–8 are implemented; the [README](../README.md) is the overview, and
+this document holds the detail. Defaults shown for config values are starting points,
+not measurements. Every performance number comes from a script in `scripts/`, and each run's
 report is committed in `bench/results/` (§15).
 
 ## 1. Scope
