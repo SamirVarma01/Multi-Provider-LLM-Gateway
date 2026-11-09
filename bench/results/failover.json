@@ -1,0 +1,458 @@
+{
+  "meta": {
+    "tool": "failover_test",
+    "date": "2026-11-09T13:59:19Z",
+    "commit": "5b8bab0",
+    "host": "Apple M2, Darwin; Docker VM: 8 CPUs, 3.8 GiB memory",
+    "num_cpu": 8,
+    "go_version": "go1.26.10",
+    "settings": {
+      "backup": "backup",
+      "before": "10s",
+      "fault": "30s",
+      "mock_tokens": "16",
+      "mock_tps": "100",
+      "mock_ttft": "50ms",
+      "poll": "50ms",
+      "primary": "primary",
+      "rate": "50"
+    }
+  },
+  "scenarios": [
+    {
+      "name": "errors",
+      "fault": "every request fails with HTTP 500 before any output",
+      "breaker_open_ms": 200.953958,
+      "cleared_ms": 30002.920431,
+      "breaker_closed_ms": 35651.4566,
+      "max_lag_ms": 17.5676,
+      "states": [
+        {
+          "at_ms": -10000.499463,
+          "state": "closed"
+        },
+        {
+          "at_ms": 200.953958,
+          "state": "open"
+        },
+        {
+          "at_ms": 35250.003183,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 35651.4566,
+          "state": "closed"
+        }
+      ],
+      "transitions": {
+        "closed": 1,
+        "half_open": 3,
+        "open": 3
+      },
+      "phases": [
+        {
+          "name": "before the fault",
+          "from_ms": -10000.755046,
+          "to_ms": 0,
+          "requests": 501,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 1,
+            "primary": 500
+          },
+          "retried": 1,
+          "latency": {
+            "n": 501,
+            "mean_ms": 205.692534,
+            "p50_ms": 205.415045,
+            "p95_ms": 209.228794,
+            "p99_ms": 212.093542,
+            "max_ms": 222.088546
+          }
+        },
+        {
+          "name": "fault, until the breaker opened",
+          "from_ms": 0,
+          "to_ms": 200.953958,
+          "requests": 10,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 10
+          },
+          "retried": 9,
+          "latency": {
+            "n": 10,
+            "mean_ms": 204.000537,
+            "p50_ms": 203.423671,
+            "p95_ms": 208.141255,
+            "p99_ms": 208.141255,
+            "max_ms": 208.141255
+          }
+        },
+        {
+          "name": "fault, breaker open",
+          "from_ms": 200.953958,
+          "to_ms": 30002.920431,
+          "requests": 1490,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 1490
+          },
+          "retried": 2,
+          "latency": {
+            "n": 1490,
+            "mean_ms": 206.252147,
+            "p50_ms": 205.877518,
+            "p95_ms": 210.177427,
+            "p99_ms": 217.180928,
+            "max_ms": 246.259965
+          }
+        },
+        {
+          "name": "fixed, until the breaker closed",
+          "from_ms": 30002.920431,
+          "to_ms": 35651.4566,
+          "requests": 282,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 280,
+            "primary": 2
+          },
+          "retried": 0,
+          "latency": {
+            "n": 282,
+            "mean_ms": 205.933199,
+            "p50_ms": 205.509394,
+            "p95_ms": 209.489228,
+            "p99_ms": 214.078727,
+            "max_ms": 228.402479
+          }
+        },
+        {
+          "name": "after the breaker closed",
+          "from_ms": 35651.4566,
+          "to_ms": 40660.244954,
+          "requests": 251,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "primary": 251
+          },
+          "retried": 0,
+          "latency": {
+            "n": 251,
+            "mean_ms": 206.084229,
+            "p50_ms": 205.835231,
+            "p95_ms": 209.900856,
+            "p99_ms": 212.494231,
+            "max_ms": 213.087563
+          }
+        }
+      ]
+    },
+    {
+      "name": "hang",
+      "fault": "requests are accepted and never answered",
+      "breaker_open_ms": 10099.497797,
+      "cleared_ms": 30001.86143,
+      "breaker_closed_ms": 35550.196725,
+      "max_lag_ms": 19.599764,
+      "states": [
+        {
+          "at_ms": -9998.850005,
+          "state": "closed"
+        },
+        {
+          "at_ms": 10099.497797,
+          "state": "open"
+        },
+        {
+          "at_ms": 15150.313882,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 25149.701511,
+          "state": "open"
+        },
+        {
+          "at_ms": 35150.416475,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 35550.196725,
+          "state": "closed"
+        }
+      ],
+      "transitions": {
+        "closed": 1,
+        "half_open": 2,
+        "open": 2
+      },
+      "phases": [
+        {
+          "name": "before the fault",
+          "from_ms": -10001.228838,
+          "to_ms": 0,
+          "requests": 501,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 1,
+            "primary": 500
+          },
+          "retried": 1,
+          "latency": {
+            "n": 501,
+            "mean_ms": 225.699811,
+            "p50_ms": 205.542501,
+            "p95_ms": 209.044546,
+            "p99_ms": 213.666585,
+            "max_ms": 10207.664593
+          }
+        },
+        {
+          "name": "fault, until the breaker opened",
+          "from_ms": 0,
+          "to_ms": 10099.497797,
+          "requests": 505,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 505
+          },
+          "retried": 504,
+          "latency": {
+            "n": 505,
+            "mean_ms": 10188.901316,
+            "p50_ms": 10207.77076,
+            "p95_ms": 10212.713969,
+            "p99_ms": 10225.500885,
+            "max_ms": 10283.143804
+          }
+        },
+        {
+          "name": "fault, breaker open",
+          "from_ms": 10099.497797,
+          "to_ms": 30001.86143,
+          "requests": 995,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 995
+          },
+          "retried": 1,
+          "latency": {
+            "n": 995,
+            "mean_ms": 215.405057,
+            "p50_ms": 204.898427,
+            "p95_ms": 208.545848,
+            "p99_ms": 214.791306,
+            "max_ms": 10206.9281
+          }
+        },
+        {
+          "name": "fixed, until the breaker closed",
+          "from_ms": 30001.86143,
+          "to_ms": 35550.196725,
+          "requests": 277,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 275,
+            "primary": 2
+          },
+          "retried": 0,
+          "latency": {
+            "n": 277,
+            "mean_ms": 205.750532,
+            "p50_ms": 205.560769,
+            "p95_ms": 208.759896,
+            "p99_ms": 213.829938,
+            "max_ms": 220.841561
+          }
+        },
+        {
+          "name": "after the breaker closed",
+          "from_ms": 35550.196725,
+          "to_ms": 40559.771162,
+          "requests": 251,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "primary": 251
+          },
+          "retried": 0,
+          "latency": {
+            "n": 251,
+            "mean_ms": 205.267718,
+            "p50_ms": 205.06244,
+            "p95_ms": 207.75473,
+            "p99_ms": 212.311357,
+            "max_ms": 215.907647
+          }
+        }
+      ]
+    },
+    {
+      "name": "midstream",
+      "fault": "every response is cut off after 4 tokens of output",
+      "breaker_open_ms": 300.710126,
+      "cleared_ms": 30000.564264,
+      "breaker_closed_ms": 35951.608809,
+      "max_lag_ms": 23.053839,
+      "states": [
+        {
+          "at_ms": -9998.794253,
+          "state": "closed"
+        },
+        {
+          "at_ms": 300.710126,
+          "state": "open"
+        },
+        {
+          "at_ms": 5299.876711,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 5400.017045,
+          "state": "open"
+        },
+        {
+          "at_ms": 15401.606216,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 15499.57105,
+          "state": "open"
+        },
+        {
+          "at_ms": 35501.736725,
+          "state": "half_open"
+        },
+        {
+          "at_ms": 35951.608809,
+          "state": "closed"
+        }
+      ],
+      "transitions": {
+        "closed": 1,
+        "half_open": 3,
+        "open": 3
+      },
+      "phases": [
+        {
+          "name": "before the fault",
+          "from_ms": -10001.132545,
+          "to_ms": 0,
+          "requests": 501,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 1,
+            "primary": 500
+          },
+          "retried": 1,
+          "latency": {
+            "n": 501,
+            "mean_ms": 205.968004,
+            "p50_ms": 205.552919,
+            "p95_ms": 209.180918,
+            "p99_ms": 217.041043,
+            "max_ms": 289.735712
+          }
+        },
+        {
+          "name": "fault, until the breaker opened",
+          "from_ms": 0,
+          "to_ms": 300.710126,
+          "requests": 15,
+          "errors": 7,
+          "stream_errors": 7,
+          "error_kinds": {
+            "stream error: The provider failed mid-stream.": 7
+          },
+          "served_by": {
+            "backup": 8
+          },
+          "retried": 6,
+          "latency": {
+            "n": 15,
+            "mean_ms": 183.386429,
+            "p50_ms": 204.595712,
+            "p95_ms": 290.920004,
+            "p99_ms": 290.920004,
+            "max_ms": 290.920004
+          }
+        },
+        {
+          "name": "fault, breaker open",
+          "from_ms": 300.710126,
+          "to_ms": 30000.564264,
+          "requests": 1485,
+          "errors": 1,
+          "stream_errors": 1,
+          "error_kinds": {
+            "stream error: The provider failed mid-stream.": 1
+          },
+          "served_by": {
+            "backup": 1484
+          },
+          "retried": 1,
+          "latency": {
+            "n": 1485,
+            "mean_ms": 205.685911,
+            "p50_ms": 205.627966,
+            "p95_ms": 208.211296,
+            "p99_ms": 214.481969,
+            "max_ms": 289.84634
+          }
+        },
+        {
+          "name": "fixed, until the breaker closed",
+          "from_ms": 30000.564264,
+          "to_ms": 35951.608809,
+          "requests": 297,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "backup": 293,
+            "primary": 4
+          },
+          "retried": 0,
+          "latency": {
+            "n": 297,
+            "mean_ms": 206.059458,
+            "p50_ms": 205.748601,
+            "p95_ms": 209.769144,
+            "p99_ms": 217.287727,
+            "max_ms": 227.426854
+          }
+        },
+        {
+          "name": "after the breaker closed",
+          "from_ms": 35951.608809,
+          "to_ms": 40959.867455,
+          "requests": 251,
+          "errors": 0,
+          "stream_errors": 0,
+          "served_by": {
+            "primary": 251
+          },
+          "retried": 0,
+          "latency": {
+            "n": 251,
+            "mean_ms": 205.871505,
+            "p50_ms": 205.509604,
+            "p95_ms": 210.849312,
+            "p99_ms": 214.835188,
+            "max_ms": 217.282979
+          }
+        }
+      ]
+    }
+  ]
+}

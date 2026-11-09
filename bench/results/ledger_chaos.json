@@ -1,0 +1,191 @@
+{
+  "meta": {
+    "tool": "ledger_chaos",
+    "date": "2026-11-09T14:02:13Z",
+    "commit": "5b8bab0",
+    "host": "Apple M2, Darwin; Docker VM: 8 CPUs, 3.8 GiB memory",
+    "num_cpu": 8,
+    "go_version": "go1.26.0",
+    "settings": {
+      "aliases": "bench,failover,bench-claude",
+      "down": "0s–2s",
+      "keys": "4",
+      "kills": "20",
+      "mock_tokens": "48",
+      "mock_tps": "50",
+      "mock_ttft": "100ms",
+      "primary_errors": "0.1",
+      "rate": "40",
+      "reconcile_grace": "10s",
+      "request_timeout": "20s",
+      "seed": "1",
+      "signals": "KILL",
+      "tail": "5s",
+      "up": "3s–8s"
+    }
+  },
+  "load": {
+    "sent": 5662,
+    "ok": 3827,
+    "errors": {
+      "connection dropped": 982,
+      "connection refused": 853
+    },
+    "duration_ms": 141530.673083
+  },
+  "kills": [
+    {
+      "at_ms": 4450.93375,
+      "signal": "KILL",
+      "in_flight": 32,
+      "down_ms": 1894.92825
+    },
+    {
+      "at_ms": 9659.433916,
+      "signal": "KILL",
+      "in_flight": 38,
+      "down_ms": 1147.538625
+    },
+    {
+      "at_ms": 16176.147333,
+      "signal": "KILL",
+      "in_flight": 35,
+      "down_ms": 2008.526541
+    },
+    {
+      "at_ms": 21560.293208,
+      "signal": "KILL",
+      "in_flight": 36,
+      "down_ms": 1909.856958
+    },
+    {
+      "at_ms": 30415.034375,
+      "signal": "KILL",
+      "in_flight": 34,
+      "down_ms": 1200.827417
+    },
+    {
+      "at_ms": 38197.315041,
+      "signal": "KILL",
+      "in_flight": 37,
+      "down_ms": 2093.108458
+    },
+    {
+      "at_ms": 45916.730583,
+      "signal": "KILL",
+      "in_flight": 37,
+      "down_ms": 843.820125
+    },
+    {
+      "at_ms": 50282.573416,
+      "signal": "KILL",
+      "in_flight": 37,
+      "down_ms": 1956.552458
+    },
+    {
+      "at_ms": 59548.277333,
+      "signal": "KILL",
+      "in_flight": 33,
+      "down_ms": 2160.512917
+    },
+    {
+      "at_ms": 66372.694708,
+      "signal": "KILL",
+      "in_flight": 41,
+      "down_ms": 1196.51675
+    },
+    {
+      "at_ms": 74209.8655,
+      "signal": "KILL",
+      "in_flight": 35,
+      "down_ms": 1406.300334
+    },
+    {
+      "at_ms": 79146.006,
+      "signal": "KILL",
+      "in_flight": 35,
+      "down_ms": 1265.838792
+    },
+    {
+      "at_ms": 87900.2905,
+      "signal": "KILL",
+      "in_flight": 38,
+      "down_ms": 954.3025
+    },
+    {
+      "at_ms": 93557.766291,
+      "signal": "KILL",
+      "in_flight": 37,
+      "down_ms": 2210.466416
+    },
+    {
+      "at_ms": 99886.069041,
+      "signal": "KILL",
+      "in_flight": 33,
+      "down_ms": 945.282541
+    },
+    {
+      "at_ms": 106930.449291,
+      "signal": "KILL",
+      "in_flight": 39,
+      "down_ms": 863.352125
+    },
+    {
+      "at_ms": 112115.540125,
+      "signal": "KILL",
+      "in_flight": 38,
+      "down_ms": 1590.988959
+    },
+    {
+      "at_ms": 120408.418291,
+      "signal": "KILL",
+      "in_flight": 38,
+      "down_ms": 2335.626458
+    },
+    {
+      "at_ms": 127037.379541,
+      "signal": "KILL",
+      "in_flight": 37,
+      "down_ms": 1175.035167
+    },
+    {
+      "at_ms": 135716.261166,
+      "signal": "KILL",
+      "in_flight": 38,
+      "down_ms": 813.97
+    }
+  ],
+  "audit": {
+    "keys": 4,
+    "requests": 4554,
+    "open": 0,
+    "gateway": {
+      "settled": 3827,
+      "estimated": 0,
+      "compared": 3827,
+      "mismatched": 0
+    },
+    "reconciler": {
+      "settled": 646,
+      "estimated": 0,
+      "compared": 646,
+      "mismatched": 0
+    },
+    "released": {
+      "orphan_no_call": 81
+    },
+    "billed_not_charged": 0,
+    "violations": {},
+    "samples": null
+  },
+  "checks": {
+    "double_charges": 0,
+    "double_closes": 0,
+    "billed_unknown": 0,
+    "client_matched": 2861,
+    "client_mismatched": 0,
+    "client_no_usage": 966,
+    "open_before_reconcile": 40,
+    "reconcile_passes": 1
+  }
+}
