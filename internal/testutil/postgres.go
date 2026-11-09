@@ -47,7 +47,9 @@ func Main(m *testing.M) {
 	code := m.Run()
 	for _, id := range []string{pg.containerID, rd.containerID} {
 		if id != "" {
-			_ = exec.Command("docker", "rm", "-f", id).Run()
+			// -v also removes the anonymous volume the image keeps its data
+			// in. Without it, every run leaves one behind.
+			_ = exec.Command("docker", "rm", "-f", "-v", id).Run()
 		}
 	}
 	if code == 0 {
