@@ -42,12 +42,48 @@ export BENCH_HOST="$cpu, $(uname -s); Docker VM: $(docker info --format '{{.NCPU
 
 dc() { docker compose -p "$project" -f compose.yaml -f compose.bench.yaml "$@"; }
 
+# Docker's disk lives on the host's (Docker Desktop's disk image grows into
+# it), and when the host's disk fills, the Docker engine crashes. So a run
+# refuses to start, and stops, when less than BENCH_MIN_FREE_MB is free on
+# BENCH_DISK, which must be on the same filesystem as Docker's data.
+min_free_mb=${BENCH_MIN_FREE_MB:-1024}
+disk=${BENCH_DISK:-$HOME}
+check_disk() {
+  local free
+  free=$(df -Pm "$disk" | awk 'NR == 2 { print $4 }')
+  if ((free < min_free_mb)); then
+    echo "bench: only $free MB free on $disk, less than BENCH_MIN_FREE_MB=$min_free_mb" >&2
+    return 1
+  fi
+}
+
+# watch_disk takes the stack down if the disk runs low during a run. The
+# benchmark then fails, and its results are not kept.
+watch_disk() {
+  while sleep 5; do
+    if ! check_disk; then
+      echo "bench: stopping the stack before the disk fills" >&2
+      dc down -v --remove-orphans --timeout 1 >/dev/null 2>&1 || true
+      return
+    fi
+  done
+}
+
 cleanup() {
+  if [[ -n "${watcher:-}" ]]; then
+    kill "$watcher" 2>/dev/null || true
+  fi
+  # A failed run's partial output.
+  rm -f "$out"/*.tmp
   if [[ -z "${KEEP:-}" ]]; then
     dc down -v --remove-orphans >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
+
+check_disk || exit 1
+watch_disk &
+watcher=$!
 
 # up starts a fresh stack: an empty ledger and no mock usage records.
 up() {
