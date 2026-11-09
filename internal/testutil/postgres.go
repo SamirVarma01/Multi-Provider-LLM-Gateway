@@ -81,7 +81,7 @@ func NewDatabase(t testing.TB) *pgxpool.Pool {
 	if err != nil {
 		t.Fatalf("connect admin db: %v", err)
 	}
-	defer admin.Close(ctx)
+	defer func() { _ = admin.Close(ctx) }()
 	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
 		t.Fatalf("create database: %v", err)
 	}

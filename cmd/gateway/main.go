@@ -81,7 +81,7 @@ func run() error {
 	}
 	redisOpts.ContextTimeoutEnabled = true // RATELIMIT_TIMEOUT must reach the socket
 	rdb := redis.NewClient(redisOpts)
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	keys := auth.NewPGStore(pool)
 	led := ledger.New(pool)
