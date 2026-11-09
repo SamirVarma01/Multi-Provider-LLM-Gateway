@@ -31,7 +31,7 @@ type fakeStream struct {
 
 func (s *fakeStream) Recv() (*provider.Chunk, error) {
 	if len(s.steps) == 0 {
-		if s.end == errHang {
+		if errors.Is(s.end, errHang) {
 			<-s.ctx.Done()
 			return nil, s.ctx.Err()
 		}

@@ -160,7 +160,7 @@ func TestAnthropicRejectsWhatTheAPIRejects(t *testing.T) {
 				Error struct{ Type, Message string }
 			}
 			_ = json.NewDecoder(resp.Body).Decode(&e)
-			if resp.StatusCode != 400 || e.Type != "error" || e.Error.Type != "invalid_request_error" ||
+			if resp.StatusCode != http.StatusBadRequest || e.Type != "error" || e.Error.Type != "invalid_request_error" ||
 				!strings.Contains(e.Error.Message, tt.want) {
 				t.Errorf("status %d body %+v", resp.StatusCode, e)
 			}

@@ -76,7 +76,7 @@ func startRedis() {
 		return
 	}
 	client := redis.NewClient(opts)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

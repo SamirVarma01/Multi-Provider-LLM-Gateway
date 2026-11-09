@@ -213,7 +213,7 @@ func TestFailedRequestsAreReleased(t *testing.T) {
 			e := newEnv(t, tt.b, nil)
 			resp := e.chat(t, chatReq("chat", nil))
 			reqID := resp.Header.Get(obs.RequestIDHeader)
-			io.Copy(io.Discard, resp.Body)
+			_, _ = io.Copy(io.Discard, resp.Body)
 			if o := e.outcome(t); o.Billable {
 				t.Errorf("outcome = %+v", o)
 			}

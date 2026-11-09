@@ -38,7 +38,7 @@ func request() *provider.ChatRequest {
 func setup(t *testing.T, b mock.Behavior, wrap func(http.Handler) http.Handler) (*mock.Server, *Provider) {
 	t.Helper()
 	m := mock.New(mock.Options{Defaults: b, Seed: 7})
-	var h http.Handler = m.Handler()
+	h := m.Handler()
 	if wrap != nil {
 		h = wrap(h)
 	}
@@ -151,7 +151,7 @@ func TestMidStreamFailures(t *testing.T) {
 				t.Error("usage must not be reported for an interrupted stream")
 			}
 			// The error is sticky.
-			if _, err2 := s.Recv(); err2 != err {
+			if _, err2 := s.Recv(); !errors.Is(err2, err) {
 				t.Errorf("second Recv = %v, want %v", err2, err)
 			}
 		})

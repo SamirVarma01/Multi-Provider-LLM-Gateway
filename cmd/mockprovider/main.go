@@ -94,7 +94,13 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() {
+			// The usage file is the record of what was billed, so a failed
+			// close, which can mean lost writes, must not pass silently.
+			if err := f.Close(); err != nil {
+				logger.Error("close usage file", "err", err)
+			}
+		}()
 		opts.UsageLog = f
 	}
 	server := mock.New(opts)
@@ -104,7 +110,7 @@ func run() error {
 			return err
 		}
 		restored, skipped, err := server.Restore(f)
-		f.Close()
+		_ = f.Close() // read only
 		if err != nil {
 			return fmt.Errorf("restore usage: %w", err)
 		}
